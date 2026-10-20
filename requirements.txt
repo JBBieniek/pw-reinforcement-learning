@@ -3,3 +3,4 @@ gymnasium[atari]
 ale-py
 pygame
 numpy
+stable-baselines3[extra]
