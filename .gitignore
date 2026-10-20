@@ -1,0 +1,50 @@
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Testing and linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# RL training outputs
+logs/
+runs/
+tensorboard/
+checkpoints/
+models/
+wandb/
+
+# Generated data and results
+results/
+outputs/
+videos/
+*.mp4
+
+# OS files
+.DS_Store
+Thumbs.db
