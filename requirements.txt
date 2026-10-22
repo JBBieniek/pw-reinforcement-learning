@@ -3,4 +3,6 @@ gymnasium[atari]
 ale-py
 pygame
 numpy
+torch
 stable-baselines3[extra]
+tqdm
