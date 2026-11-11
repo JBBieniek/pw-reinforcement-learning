@@ -10,7 +10,7 @@ env = gym.make(
     render_mode="human",
 )
 
-obs, info = env.reset(seed=42)
+obs, info = env.reset()
 
 # FIRE – uruchomienie piłki
 env.step(1)
