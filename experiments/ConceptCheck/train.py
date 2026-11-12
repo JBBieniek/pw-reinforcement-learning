@@ -197,7 +197,9 @@ def train(argv=None):
         recent_loss = restored["recent_loss"]
         elapsed_seconds = restored.get("elapsed_seconds", 0.0)
         health.set_state(restored.get("health_state", {}))
-        print(f"Resumed step {step}; replay={len(replay_buffer)}; exact game restore={restored['environment_restored']}")
+        print(f"Resumed step {step}; replay={len(replay_buffer)}; "
+              f"game restored={restored['environment_restored']}; "
+              f"exact trajectory={restored['environment_restore_exact']}")
         del restored, resume_state
     run = TrainingRun(args, device, start_step=step, elapsed_seconds=elapsed_seconds)
     end_step = min(args.steps, args.stop_at) if args.stop_at is not None else args.steps

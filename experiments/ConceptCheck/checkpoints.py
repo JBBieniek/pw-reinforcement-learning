@@ -2,10 +2,12 @@
 
 Only load trusted local snapshots: these contain NumPy arrays, replay deques and
 Python RNG state, and therefore deliberately use ``torch.load(weights_only=False)``.
-The installed ALE/Gymnasium stack can resume the current game exactly, including
-sticky-action RNG and preprocessing buffers. Other environments may implement
-``get_state()`` / ``set_state(state)`` on the outer environment. Without either
-protocol, resuming starts a new episode and reports ``environment_restored=False``.
+The installed ALE/Gymnasium stack restores emulator state, RNG and preprocessing
+buffers. ALE 0.12.1 omits its previous applied sticky action from serialization,
+so restoring a sticky environment does not guarantee an identical future
+trajectory. Other environments may implement ``get_state()`` / ``set_state(state)``
+on the outer environment. Without either protocol, resuming starts a new episode
+and reports ``environment_restored=False``.
 """
 
 from collections import deque
@@ -175,6 +177,29 @@ def _restore_environment(env, saved):
     return True
 
 
+def _environment_restore_contract(saved, restored):
+    """Distinguish restoring the game from reproducing its future trajectory."""
+    if not restored:
+        return False, "Environment state was unavailable; resuming in a new episode"
+    if saved["kind"] == "protocol":
+        return True, "Environment restored through its get_state/set_state protocol"
+    if saved["kind"] == "ale":
+        if saved["settings"]["repeat_action_probability"] > 0:
+            version = saved["ale_version"]
+            if version == "0.12.1":
+                return False, (
+                    "ALE 0.12.1 restored emulator/RNG state, but does not serialize the "
+                    "previous applied sticky action; an identical future trajectory is not guaranteed"
+                )
+            return False, (
+                f"Exact sticky-action trajectory restoration has not been verified for ALE {version}"
+            )
+        # _restore_environment already checked ALE/Gymnasium versions, settings
+        # and the supported wrapper stack before reaching this contract.
+        return True, "ALE state restored with sticky actions disabled"
+    return False, "Exact environment trajectory restoration is not supported"
+
+
 def _capture_rng():
     return {
         "python": random.getstate(), "numpy": np.random.get_state(),
@@ -272,7 +297,9 @@ def restore_training_checkpoint(checkpoint, *, policy_net, target_net, optimizer
                                 env, device):
     """Restore models/optimizer/environment/RNG and return the saved counters.
 
-    ``environment_restored`` is true only for an exact emulator/protocol restore.
+    ``environment_restored`` reports restoration of emulator/protocol state;
+    ``environment_restore_exact`` separately reports trajectory reproducibility.
+    ALE 0.12.1 sticky-action history is not included in its serialized state.
     The restart fallback retains replay and optimizer, but starts a new episode
     with zero reward and a fresh observation; the interrupted episode is not
     counted as completed. Compatible hardware/software is needed for bitwise
@@ -290,6 +317,11 @@ def restore_training_checkpoint(checkpoint, *, policy_net, target_net, optimizer
     # leaves non-capturable Adam step counters on CPU, as required by PyTorch.
     result = checkpoint.copy()
     result["environment_restored"] = _restore_environment(env, checkpoint["environment"])
+    exact, reason = _environment_restore_contract(checkpoint["environment"], result["environment_restored"])
+    result["environment_restore_exact"] = exact
+    result["environment_restore_reason"] = reason
+    if result["environment_restored"] and not exact:
+        warnings.warn(reason, RuntimeWarning, stacklevel=2)
     if not result["environment_restored"]:
         warnings.warn("Environment state was unavailable; resuming in a new episode", RuntimeWarning)
         state, _ = env.reset()

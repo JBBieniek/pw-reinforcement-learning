@@ -1,4 +1,4 @@
-"""Snapshot integrity and exact ALE continuation, including sticky actions."""
+"""Snapshot integrity and truthful environment-trajectory restoration flags."""
 
 from collections import deque
 from pathlib import Path
@@ -64,6 +64,8 @@ class CheckpointTests(unittest.TestCase):
                 optimizer=self.optimizer, env=env, device="cpu",
             )
             self.assertTrue(restored["environment_restored"])
+            self.assertTrue(restored["environment_restore_exact"])
+            self.assertIn("protocol", restored["environment_restore_reason"])
             self.assertEqual(env.position, 3)
             self.assertEqual(restored["step"], 21)
             self.assertEqual(restored["episode_reward"], 2.0)
@@ -96,12 +98,63 @@ class CheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "version"):
                 checkpoints.load_training_checkpoint(path)
 
-    def test_real_ale_future_matches_after_restore_in_new_emulator(self):
+    def test_sticky_ale_flags_derive_from_legacy_settings_without_changing_saved_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.training.pt"
+            self.save(path)
+            for sticky in (0.0, 0.25):
+                with self.subTest(sticky=sticky):
+                    loaded = checkpoints.load_training_checkpoint(path)
+                    loaded["environment"] = {"kind": "ale", "ale_version": "0.12.1",
+                                              "settings": {"repeat_action_probability": sticky}}
+                    before_policy = {name: value.clone() for name, value in loaded["policy_net"].items()}
+                    with patch.object(checkpoints, "_restore_environment", return_value=True):
+                        if sticky:
+                            with self.assertWarnsRegex(RuntimeWarning, "previous applied sticky action"):
+                                restored = checkpoints.restore_training_checkpoint(
+                                    loaded, policy_net=self.policy, target_net=self.target,
+                                    optimizer=self.optimizer, env=ProtocolEnvironment(), device="cpu")
+                        else:
+                            restored = checkpoints.restore_training_checkpoint(
+                                loaded, policy_net=self.policy, target_net=self.target,
+                                optimizer=self.optimizer, env=ProtocolEnvironment(), device="cpu")
+                    self.assertTrue(restored["environment_restored"])
+                    self.assertIs(restored["environment_restore_exact"], not bool(sticky))
+                    self.assertEqual(restored["step"], loaded["step"])
+                    self.assertEqual(restored["epsilon"], loaded["epsilon"])
+                    self.assertEqual(restored["episode_reward"], loaded["episode_reward"])
+                    self.assertIs(restored["replay_buffer"], loaded["replay_buffer"])
+                    np.testing.assert_array_equal(restored["state"], loaded["state"])
+                    for name, value in self.policy.state_dict().items():
+                        torch.testing.assert_close(value, before_policy[name], rtol=0, atol=0)
+
+    def test_restart_fallback_reports_no_exact_trajectory_and_keeps_optimizer(self):
+        class RestartEnvironment:
+            def reset(self):
+                return np.array([99], dtype=np.uint8), {}
+
+        env = RestartEnvironment()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.training.pt"
+            self.save(path, env=env)
+            loaded = checkpoints.load_training_checkpoint(path)
+            with self.assertWarnsRegex(RuntimeWarning, "new episode"):
+                restored = checkpoints.restore_training_checkpoint(
+                    loaded, policy_net=self.policy, target_net=self.target,
+                    optimizer=self.optimizer, env=env, device="cpu")
+            self.assertFalse(restored["environment_restored"])
+            self.assertFalse(restored["environment_restore_exact"])
+            self.assertIn("new episode", restored["environment_restore_reason"])
+            self.assertEqual(len(self.optimizer.state), 2)
+            self.assertIs(restored["replay_buffer"], loaded["replay_buffer"])
+            np.testing.assert_array_equal(restored["state"], [99])
+
+    def test_real_ale_without_stickiness_future_matches_after_restore_in_new_emulator(self):
         import gymnasium as gym
         from experiments.ConceptCheck.neural_network import make_breakout_env
 
         def make():
-            return gym.wrappers.TimeLimit(make_breakout_env(), max_episode_steps=97)
+            return gym.wrappers.TimeLimit(make_breakout_env(sticky_action_probability=0.0), max_episode_steps=97)
 
         def future(env):
             result = []
@@ -137,6 +190,7 @@ class CheckpointTests(unittest.TestCase):
                 env=restored_env, device="cpu",
             )
             self.assertTrue(restored["environment_restored"])
+            self.assertTrue(restored["environment_restore_exact"])
             np.testing.assert_array_equal(restored["state"], observation)
             actual = future(restored_env)
             for step, (left, right) in enumerate(zip(expected, actual)):

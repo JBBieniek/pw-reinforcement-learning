@@ -40,6 +40,8 @@ W `train.py` `--steps` to łączny cel, a `--stop-at` robi przerwę w treningu.
 `.training.pt` zachowuje sieci, optymalizator, replay, RNG i stan gry. Wznawiaj tylko
 zaufane lokalne pliki. Starsze `.step-*.pth` są małymi kopiami do oceny; pełny stan
 jest nadpisywany. Dawne pliki samych wag nie zawierają pełnego stanu treningu.
+Przy sticky actions w ALE 0.12.1 zapis nie gwarantuje identycznej trajektorii po
+wznowieniu: emulator nie zapisuje całej historii ostatniego wejścia.
 DQN i DDQN porównuj przy tych samych seedach, ustawieniach gry i liczbie decyzji,
 w osobnych katalogach. Jeden krok to domyślnie około czterech klatek emulatora.
 Nowe treningi używają LeakyReLU i deterministycznych operacji; obie metody muszą
