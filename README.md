@@ -25,6 +25,7 @@ python -m experiments.ConceptCheck.validate_stability --run-dir outputs/validati
 python -m experiments.ConceptCheck.experiment --algorithm double-dqn --device cuda --seed 230849415 --eval-seed 3303497698 --max-steps-per-second 220 --run-dir outputs/ddqn-stable-15m
 python -m experiments.ConceptCheck.experiment --algorithm dqn --device cuda --seed 230849415 --eval-seed 3303497698 --max-steps-per-second 0 --run-dir outputs/dqn-stable-15m
 python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-stable-15m --resume-experiment
+python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-stable-15m --resume-experiment --append-milestones 20000000,25000000 --max-steps-per-second 0
 python -m experiments.ConceptCheck.test --model-path outputs/ddqn-stable-15m/model.step-010000000.pth --episodes 100 --seed 3303497698
 python -m unittest discover -s tests -v
 ```
@@ -33,7 +34,8 @@ python -m unittest discover -s tests -v
 `train.py` i `test.py` wybierają sprzęt automatycznie, gdy pominięto `--device`.
 Bez `--seed` ziarno jest losowane; jego wartość trafia do logu i konfiguracji treningu.
 Sterownik ocenia 100 gier po 1, 2, 4, 7, 10 i 15 mln decyzji, zapisuje porównanie
-i sam wznawia trening. Limit tempa zostawia przerwy dla innych aplikacji.
+i sam wznawia trening. Limit tempa zostawia przerwy dla innych aplikacji; `0` go usuwa.
+Po zakończeniu biegu `--append-milestones` dopisuje dalsze oceny i kontynuuje pełny stan.
 W `train.py` `--steps` to łączny cel, a `--stop-at` robi przerwę w treningu.
 `.training.pt` zachowuje sieci, optymalizator, replay, RNG i stan gry. Wznawiaj tylko
 zaufane lokalne pliki. Starsze `.step-*.pth` są małymi kopiami do oceny; pełny stan

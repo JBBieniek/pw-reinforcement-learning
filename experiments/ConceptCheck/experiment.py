@@ -48,6 +48,28 @@ def _milestones(value):
     return values
 
 
+def _validate_extension_history(milestones, previous_targets, history):
+    """Only durable, contiguous extensions can authorize an older checkpoint target."""
+    if (not isinstance(previous_targets, list) or not isinstance(history, list)
+            or any(type(target) is not int for target in previous_targets)):
+        raise ValueError("invalid experiment extension history")
+    targets = []
+    last = None
+    for extension in history:
+        before = extension["from_milestones"]
+        appended = extension["appended_milestones"]
+        if (not isinstance(before, list) or not isinstance(appended, list)
+                or not before or not appended
+                or any(type(item) is not int or item <= 0 for item in before + appended)
+                or before + appended != sorted(set(before + appended))
+                or (last is not None and before != last)):
+            raise ValueError("invalid experiment extension history")
+        last = before + appended
+        targets.append(before[-1])
+    if targets != previous_targets or (last is not None and last != milestones):
+        raise ValueError("experiment target history does not match its milestones")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--run-dir", required=True, help="Separate output directory for this algorithm")
@@ -55,6 +77,8 @@ def parse_args(argv=None):
     parser.add_argument("--activation", choices=["relu", "leaky-relu"], default="leaky-relu")
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--milestones", type=_milestones, default=_milestones(DEFAULT_MILESTONES))
+    parser.add_argument("--append-milestones", type=_milestones,
+                        help="Append later evaluation budgets to a completed experiment")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--eval-seed", type=int, default=3303497698)
     parser.add_argument("--eval-episodes", type=int, default=100)
@@ -64,7 +88,11 @@ def parse_args(argv=None):
     parser.add_argument("--resume-experiment", action="store_true")
     arguments = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(arguments)
+    if args.append_milestones is not None and not args.resume_experiment:
+        parser.error("--append-milestones requires --resume-experiment")
     supplied = {item.split("=", 1)[0] for item in arguments if item.startswith("--")}
+    if args.append_milestones is not None and "--milestones" in supplied:
+        parser.error("use --append-milestones without --milestones when extending an experiment")
     args.run_dir = str(Path(args.run_dir).resolve())
     config_path = Path(args.run_dir) / "experiment.config.json"
     if args.resume_experiment:
@@ -73,6 +101,15 @@ def parse_args(argv=None):
         saved = json.loads(config_path.read_text(encoding="utf-8"))
         if saved.get("format_version") != 1:
             parser.error("unsupported experiment config version")
+        args._saved_config = saved
+        previous_targets = saved.get("previous_targets", [])
+        extension_history = saved.get("milestone_extensions", [])
+        try:
+            _validate_extension_history(saved["milestones"], previous_targets, extension_history)
+        except (KeyError, TypeError, ValueError) as error:
+            parser.error(str(error))
+        args.previous_targets = list(previous_targets)
+        args.milestone_extensions = list(extension_history)
         legacy_defaults = {"activation": "relu", "deterministic": False}
         for name in ("algorithm", "activation", "deterministic", "milestones", "seed",
                      "eval_seed", "eval_episodes", "max_steps"):
@@ -88,10 +125,18 @@ def parse_args(argv=None):
             if "--" + name.replace("_", "-") not in supplied:
                 setattr(args, name, saved[name])
         args.created_at_utc = saved["created_at_utc"]
+        args._append_replay = bool(args.milestone_extensions and args.append_milestones
+                                  == args.milestone_extensions[-1]["appended_milestones"])
+        if (args.append_milestones is not None and not args._append_replay
+                and args.append_milestones[0] <= args.milestones[-1]):
+            parser.error("--append-milestones must be strictly above the saved final milestone")
     elif config_path.exists():
         parser.error("run directory already contains an experiment; use --resume-experiment")
     else:
         args.created_at_utc = _timestamp()
+        args.previous_targets = []
+        args.milestone_extensions = []
+        args._append_replay = False
     if args.seed is None:
         args.seed = secrets.randbits(32)
     if any(not 0 <= seed < 2**32 for seed in (args.seed, args.eval_seed)):
@@ -152,12 +197,13 @@ def _read_training_checkpoint(path):
 
 def _validated_checkpoint(path, args):
     saved = _read_training_checkpoint(path)
+    accepted_targets = [args.milestones[-1], *args.previous_targets]
     if (saved["algorithm"] != args.algorithm or saved["seed"] != args.seed
-            or saved["steps"] != args.milestones[-1]
+            or saved["steps"] not in accepted_targets
             or saved.get("activation", "relu") != args.activation
             or saved.get("deterministic", False) is not args.deterministic):
         raise ValueError("training checkpoint does not match this experiment")
-    if saved["step"] > args.milestones[-1]:
+    if saved["step"] > saved["steps"] or saved["step"] > args.milestones[-1]:
         raise ValueError("training checkpoint exceeds the experiment target")
     return saved["step"]
 
@@ -303,23 +349,53 @@ def run_experiment(argv=None):
         _write_json(progress_path, progress)
 
     with _experiment_lock(directory):
+        if args.resume_experiment and json.loads(config_path.read_text(encoding="utf-8")) != args._saved_config:
+            raise RuntimeError("experiment configuration changed before the controller acquired its lock; retry")
+        previous = {}
         if progress_path.exists():
             previous = json.loads(progress_path.read_text(encoding="utf-8"))
             previous_child = previous.get("child_pid")
             if previous_child is not None and _process_alive(previous_child):
                 raise RuntimeError(f"previous training/evaluation child {previous_child} is still running; wait before resuming")
+        saved_step = None
+        if args.append_milestones is not None:
+            previous_pid = previous.get("pid")
+            # A same-process API call is no longer running the old controller:
+            # it has already released the lock held by the previous invocation.
+            if previous_pid is not None and previous_pid != os.getpid() and _process_alive(previous_pid):
+                raise RuntimeError(f"previous experiment controller {previous_pid} is still running; wait before appending")
+            if not checkpoint.is_file():
+                raise ValueError("appending milestones requires the completed full training checkpoint")
+            if not args._append_replay:
+                if previous.get("status") != "completed":
+                    raise ValueError("--append-milestones requires a completed experiment")
+                saved_step = _validated_checkpoint(checkpoint, args)
+                if saved_step != args.milestones[-1]:
+                    raise ValueError("appending milestones requires a checkpoint at the saved final milestone")
+                before = list(args.milestones)
+                args.previous_targets = [*args.previous_targets, before[-1]]
+                args.milestone_extensions = [*args.milestone_extensions, {
+                    "from_milestones": before,
+                    "appended_milestones": list(args.append_milestones),
+                    "registered_at_utc": _timestamp(),
+                }]
+                args.milestones = before + args.append_milestones
+            else:
+                saved_step = _validated_checkpoint(checkpoint, args)
+            progress["milestones"] = args.milestones
         # Recheck after taking the lock: another controller may have created it
         # between argument parsing and lock acquisition.
         if not args.resume_experiment and any(path.exists() for path in
                 (config_path, checkpoint, directory / "model.pth", directory / "model.config.json")):
             raise ValueError("run directory already contains an experiment; use --resume-experiment")
-        config = dict(vars(args))
-        config.pop("resume_experiment")
+        config = {key: value for key, value in vars(args).items()
+                  if not key.startswith("_") and key not in ("resume_experiment", "append_milestones")}
         config["format_version"] = 1
         _write_json(config_path, config)
         update()
         try:
-            saved_step = _validated_checkpoint(checkpoint, args) if checkpoint.exists() else 0
+            if saved_step is None:
+                saved_step = _validated_checkpoint(checkpoint, args) if checkpoint.exists() else 0
             if not args.resume_experiment and saved_step:
                 raise ValueError("fresh experiment cannot overwrite an existing training checkpoint")
             for milestone in args.milestones:

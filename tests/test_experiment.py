@@ -24,6 +24,7 @@ class ChildFactory:
     def __init__(self, fail=None):
         self.commands = []
         self.fail = fail
+        self.resume_checkpoints = []
 
     def __call__(self, command, cwd):
         command = list(command)
@@ -54,6 +55,7 @@ class ChildFactory:
         checkpoint = directory / "model.training.pt"
         if "--resume" in command:
             previous = json.loads(checkpoint.read_text())
+            self.resume_checkpoints.append(previous)
             algorithm, seed = previous["algorithm"], previous["seed"]
         else:
             algorithm, seed = option(command, "--algorithm"), int(option(command, "--seed"))
@@ -133,6 +135,191 @@ class ExperimentTests(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual([int(row["decisions"]) for row in rows], [4, 8, 12])
             self.assertEqual([float(row["mean_reward"]) for row in rows], [4, 8, 12])
+
+    def test_append_trains_only_new_budgets_from_unchanged_old_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            checkpoint = json.loads((directory / "model.training.pt").read_text())
+            old_reports = {path: path.read_bytes() for path in directory.glob("eval-*.json")}
+            factory = ChildFactory()
+            result = self.run_with(factory, ["--run-dir", str(directory), "--resume-experiment",
+                                             "--append-milestones", "16,20"])
+            self.assertEqual(result["completed_milestones"], [4, 8, 12, 16, 20])
+            self.assertEqual(len(factory.commands), 4)
+            self.assertEqual(factory.resume_checkpoints[0], checkpoint)
+            trains = factory.commands[::2]
+            self.assertEqual([int(option(command, "--stop-at")) for command in trains], [16, 20])
+            for command in trains:
+                self.assertEqual(option(command, "--steps"), "20")
+                self.assertIn("--resume", command)
+                self.assertNotIn("--epsilon-decay-steps", command)
+                self.assertNotIn("--seed", command)
+            for path, before in old_reports.items():
+                self.assertEqual(path.read_bytes(), before)
+            config = json.loads((directory / "experiment.config.json").read_text())
+            self.assertEqual(config["previous_targets"], [12])
+            self.assertEqual(config["milestones"], [4, 8, 12, 16, 20])
+            self.assertNotIn("append_milestones", config)
+            self.assertEqual(config["milestone_extensions"][0]["from_milestones"], [4, 8, 12])
+            with (directory / "comparison.csv").open(newline="") as stream:
+                self.assertEqual([int(row["decisions"]) for row in csv.DictReader(stream)], [4, 8, 12, 16, 20])
+
+    def test_append_requires_resume_and_preserves_immutable_milestones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            with self.assertRaises(SystemExit):
+                experiment.parse_args(["--run-dir", str(directory), "--append-milestones", "16,20"])
+            self.run_with(ChildFactory(), self.arguments(directory))
+            config = (directory / "experiment.config.json").read_bytes()
+            for extra in (["--append-milestones", "12,16"], ["--append-milestones", "8"],
+                          ["--append-milestones", "20,16"],
+                          ["--append-milestones", "16,20", "--milestones", "4,8,12"],
+                          ["--append-milestones", "16,20", "--milestones", "4,8,12,16,20"]):
+                with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                    self.run_with(ChildFactory(), ["--run-dir", str(directory), "--resume-experiment", *extra])
+            self.assertEqual((directory / "experiment.config.json").read_bytes(), config)
+
+    def test_new_append_requires_completed_progress_and_final_checkpoint_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            progress_path = directory / "experiment.progress.json"
+            checkpoint_path = directory / "model.training.pt"
+            progress = json.loads(progress_path.read_text())
+            checkpoint = json.loads(checkpoint_path.read_text())
+            invalid_cases = [("failed", checkpoint), ("training", checkpoint),
+                             ("completed", {**checkpoint, "step": 8}),
+                             ("completed", {**checkpoint, "steps": 99})]
+            for status, saved in invalid_cases:
+                with self.subTest(status=status, saved=saved):
+                    progress_path.write_text(json.dumps({**progress, "status": status}))
+                    checkpoint_path.write_text(json.dumps(saved))
+                    before = {path: path.read_bytes() for path in
+                              (progress_path, checkpoint_path, directory / "experiment.config.json")}
+                    factory = ChildFactory()
+                    with self.assertRaises(ValueError):
+                        self.run_with(factory, ["--run-dir", str(directory), "--resume-experiment",
+                                                "--append-milestones", "16,20"])
+                    self.assertEqual(factory.commands, [])
+                    for path, data in before.items():
+                        self.assertEqual(path.read_bytes(), data)
+
+    def test_live_previous_controller_blocks_append_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            progress_path = directory / "experiment.progress.json"
+            progress = json.loads(progress_path.read_text())
+            progress["pid"] = 12345
+            progress_path.write_text(json.dumps(progress))
+            before = {path: path.read_bytes() for path in (progress_path, directory / "experiment.config.json")}
+            factory = ChildFactory()
+            with patch.object(experiment, "_process_alive", return_value=True):
+                with self.assertRaisesRegex(RuntimeError, "controller.*still running"):
+                    self.run_with(factory, ["--run-dir", str(directory), "--resume-experiment",
+                                            "--append-milestones", "16,20"])
+            self.assertEqual(factory.commands, [])
+            for path, data in before.items():
+                self.assertEqual(path.read_bytes(), data)
+
+    def test_held_controller_lock_blocks_append_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            paths = [directory / name for name in ("experiment.config.json", "experiment.progress.json")]
+            before = {path: path.read_bytes() for path in paths}
+            with experiment._experiment_lock(directory):
+                with self.assertRaisesRegex(RuntimeError, "another experiment controller"):
+                    self.run_with(ChildFactory(), ["--run-dir", str(directory), "--resume-experiment",
+                                                  "--append-milestones", "16,20"])
+            for path, data in before.items():
+                self.assertEqual(path.read_bytes(), data)
+
+    def test_changed_config_is_not_overwritten_after_argument_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            config_path = directory / "experiment.config.json"
+            progress_path = directory / "experiment.progress.json"
+            before_progress = progress_path.read_bytes()
+            parse_args = experiment.parse_args
+
+            def parse_then_external_write(arguments):
+                args = parse_args(arguments)
+                config = json.loads(config_path.read_text())
+                config["max_steps_per_second"] = 123
+                config_path.write_text(json.dumps(config))
+                return args
+
+            factory = ChildFactory()
+            with patch.object(experiment, "parse_args", side_effect=parse_then_external_write):
+                with self.assertRaisesRegex(RuntimeError, "configuration changed"):
+                    self.run_with(factory, ["--run-dir", str(directory), "--resume-experiment",
+                                            "--append-milestones", "16,20"])
+            self.assertEqual(factory.commands, [])
+            self.assertEqual(json.loads(config_path.read_text())["max_steps_per_second"], 123)
+            self.assertEqual(progress_path.read_bytes(), before_progress)
+
+    def test_append_config_write_crash_can_resume_with_or_without_same_request(self):
+        for repeat_append in (False, True):
+            with self.subTest(repeat_append=repeat_append), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                self.run_with(ChildFactory(), self.arguments(directory))
+                checkpoint_path = directory / "model.training.pt"
+                before = checkpoint_path.read_bytes()
+                write_json = experiment._write_json
+
+                def crash_after_config(path, data):
+                    write_json(path, data)
+                    if path.name == "experiment.config.json":
+                        raise RuntimeError("simulated crash after config replacement")
+
+                append = ["--run-dir", str(directory), "--resume-experiment", "--append-milestones", "16,20"]
+                with patch.object(experiment, "_write_json", side_effect=crash_after_config):
+                    with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                        self.run_with(ChildFactory(), append)
+                self.assertEqual(checkpoint_path.read_bytes(), before)
+                factory = ChildFactory()
+                arguments = append if repeat_append else ["--run-dir", str(directory), "--resume-experiment"]
+                result = self.run_with(factory, arguments)
+                self.assertEqual(result["completed_milestones"], [4, 8, 12, 16, 20])
+                self.assertEqual(factory.resume_checkpoints[0]["steps"], 12)
+                config = json.loads((directory / "experiment.config.json").read_text())
+                self.assertEqual(config["previous_targets"], [12])
+                self.assertEqual(len(config["milestone_extensions"]), 1)
+
+    def test_same_append_after_training_failure_and_completed_retries_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            append = ["--run-dir", str(directory), "--resume-experiment", "--append-milestones", "16,20"]
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.run_with(ChildFactory(fail="train"), append)
+            self.run_with(ChildFactory(), append)
+            factory = ChildFactory()
+            self.run_with(factory, append)
+            self.assertEqual(factory.commands, [])
+            config = json.loads((directory / "experiment.config.json").read_text())
+            self.assertEqual(config["previous_targets"], [12])
+            self.assertEqual(len(config["milestone_extensions"]), 1)
+
+    def test_only_recorded_previous_checkpoint_targets_are_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.run_with(ChildFactory(fail="train"), ["--run-dir", str(directory), "--resume-experiment",
+                                                         "--append-milestones", "16,20"])
+            args = experiment.parse_args(["--run-dir", str(directory), "--resume-experiment"])
+            checkpoint_path = directory / "model.training.pt"
+            original = json.loads(checkpoint_path.read_text())
+            with patch.object(experiment, "_read_training_checkpoint", return_value=original):
+                self.assertEqual(experiment._validated_checkpoint(checkpoint_path, args), 12)
+            for saved in ({**original, "steps": 16}, {**original, "step": 16}):
+                with self.subTest(saved=saved), patch.object(experiment, "_read_training_checkpoint", return_value=saved):
+                    with self.assertRaises(ValueError):
+                        experiment._validated_checkpoint(checkpoint_path, args)
 
     def test_failed_evaluation_resumes_from_saved_training_without_repeating_it(self):
         with tempfile.TemporaryDirectory() as directory:
