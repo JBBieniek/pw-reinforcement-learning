@@ -15,11 +15,18 @@ from copy import deepcopy
 import os
 from pathlib import Path
 import random
+import sys
 import tempfile
 import warnings
 
 import numpy as np
 import torch
+
+if __package__:
+    from .replay import FrameReplayBuffer
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from experiments.ConceptCheck.replay import FrameReplayBuffer
 
 
 FORMAT_VERSION = 1
@@ -221,7 +228,7 @@ def _restore_rng(saved):
 def save_training_checkpoint(path, *, args, policy_net, target_net, optimizer,
                              replay_buffer, state, step, epsilon, episode_reward,
                              last_episode_reward, episodes_completed, recent_loss, env,
-                             elapsed_seconds=0.0, health_state=None):
+                             elapsed_seconds=0.0, health_state=None, previous_lives=None):
     """Atomically replace the one full snapshot without duplicating replay RAM.
 
     Call between completed environment/optimizer steps. Pickle memoization keeps
@@ -240,6 +247,7 @@ def save_training_checkpoint(path, *, args, policy_net, target_net, optimizer,
         "episodes_completed": episodes_completed, "recent_loss": recent_loss,
         "elapsed_seconds": elapsed_seconds,
         "health_state": deepcopy(health_state or {}),
+        "previous_lives": previous_lives,
         "environment": _capture_environment(env), "rng": _capture_rng(),
     }
     _validate_checkpoint(payload)
@@ -280,8 +288,16 @@ def _validate_checkpoint(checkpoint):
         raise ValueError("Invalid algorithm/config in training checkpoint")
     if not isinstance(checkpoint["step"], int) or checkpoint["step"] < 0:
         raise ValueError("Invalid completed step in training checkpoint")
-    if not isinstance(checkpoint["replay_buffer"], deque):
-        raise ValueError("Training checkpoint replay must be a deque")
+    replay = checkpoint["replay_buffer"]
+    if not isinstance(replay, (deque, FrameReplayBuffer)):
+        raise ValueError("Training checkpoint replay must be a deque or frame replay")
+    storage = checkpoint["config"].get("replay_storage", "deque")
+    if storage not in ("deque", "frames") or ((storage == "frames") != isinstance(replay, FrameReplayBuffer)):
+        raise ValueError("Training checkpoint replay storage differs from its configuration")
+    if "buffer_capacity" in checkpoint["config"] and replay.maxlen != checkpoint["config"]["buffer_capacity"]:
+        raise ValueError("Training checkpoint replay capacity differs from its configuration")
+    if checkpoint["config"].get("terminal_on_life_loss", False) and checkpoint.get("previous_lives") is None:
+        raise ValueError("Life-loss training checkpoint is missing its lives counter")
     if not isinstance(checkpoint["environment"], dict) or "kind" not in checkpoint["environment"]:
         raise ValueError("Invalid environment state in training checkpoint")
 
@@ -324,8 +340,9 @@ def restore_training_checkpoint(checkpoint, *, policy_net, target_net, optimizer
         warnings.warn(reason, RuntimeWarning, stacklevel=2)
     if not result["environment_restored"]:
         warnings.warn("Environment state was unavailable; resuming in a new episode", RuntimeWarning)
-        state, _ = env.reset()
+        state, info = env.reset()
         result["state"] = np.array(state)
+        result["previous_lives"] = info.get("lives")
         result["episode_reward"] = 0.0
         _restore_space_rngs(env, checkpoint["environment"]["spaces"])
     _restore_rng(checkpoint["rng"])

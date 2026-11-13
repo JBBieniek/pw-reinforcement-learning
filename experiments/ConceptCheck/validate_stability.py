@@ -25,11 +25,13 @@ if __package__:
     from .health import inspect_network_health
     from .neural_network import BreakoutBasicNetwork, configure_activation
     from .process_control import terminate_process_tree
+    from .replay import FrameReplayBuffer
 else:
     from checkpoints import load_training_checkpoint
     from health import inspect_network_health
     from neural_network import BreakoutBasicNetwork, configure_activation
     from process_control import terminate_process_tree
+    from experiments.ConceptCheck.replay import FrameReplayBuffer
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +42,7 @@ LEARNING_COMPONENTS = (
 COUNTERS = (
     "step", "epsilon", "episode_reward", "last_episode_reward", "episodes_completed",
     "recent_loss", "policy_training", "target_training",
+    "previous_lives",
 )
 RELATIVE_VARIATION_FLOOR = 0.01
 FEATURE_STD_FLOOR = 1e-6
@@ -99,9 +102,9 @@ def _hash_value(digest, value):
         for key in sorted(value, key=lambda item: (type(item).__name__, repr(item))):
             _hash_value(digest, key)
             _hash_value(digest, value[key])
-    elif isinstance(value, (tuple, list, deque)):
+    elif isinstance(value, (tuple, list, deque, FrameReplayBuffer)):
         digest.update(type(value).__name__.encode() + b":" + str(len(value)).encode() + b":")
-        if isinstance(value, deque):
+        if isinstance(value, (deque, FrameReplayBuffer)):
             _hash_value(digest, value.maxlen)
         for item in value:
             _hash_value(digest, item)

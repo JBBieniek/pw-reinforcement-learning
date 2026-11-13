@@ -57,18 +57,28 @@ class ChildFactory:
             previous = json.loads(checkpoint.read_text())
             self.resume_checkpoints.append(previous)
             algorithm, seed = previous["algorithm"], previous["seed"]
+            settings = {name: previous.get(name, default)
+                        for name, default in experiment.TRAINING_DEFAULTS.items()}
         else:
             algorithm, seed = option(command, "--algorithm"), int(option(command, "--seed"))
+            settings = {
+                "replay_storage": option(command, "--replay-storage"),
+                "terminal_on_life_loss": "--terminal-on-life-loss" in command,
+                "buffer_capacity": int(option(command, "--buffer-capacity")),
+                "epsilon_decay_steps": int(option(command, "--epsilon-decay-steps")),
+                "lr": float(option(command, "--lr")),
+            }
         activation = option(command, "--activation")
         deterministic = "--deterministic" in command
         step = int(option(command, "--stop-at"))
         checkpoint.write_text(json.dumps({"step": step, "algorithm": algorithm,
                                          "seed": seed, "steps": int(option(command, "--steps")),
-                                         "activation": activation, "deterministic": deterministic}))
+                                         "activation": activation, "deterministic": deterministic,
+                                         **settings}))
         weights = directory / f"model.step-{step:09d}.pth"
         weights.write_bytes(f"{algorithm}:{seed}:{step}".encode())
         weights.with_suffix(".config.json").write_text(json.dumps(
-            {**ENVIRONMENT, "activation": activation, "deterministic": deterministic}))
+            {**ENVIRONMENT, "activation": activation, "deterministic": deterministic, **settings}))
         (directory / "model.pth").write_bytes(weights.read_bytes())
 
     def evaluate(self, command):
@@ -474,6 +484,59 @@ class ExperimentTests(unittest.TestCase):
                                               7_000_000, 10_000_000, 15_000_000])
             with self.assertRaises(SystemExit):
                 experiment.parse_args(["--run-dir", directory, "--milestones", "4,4,8"])
+
+    def test_training_variants_are_forwarded_and_immutable(self):
+        settings = ["--replay-storage", "frames", "--terminal-on-life-loss",
+                    "--buffer-capacity", "200000", "--epsilon-decay-steps", "1000000",
+                    "--lr", "0.00005"]
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            factory = ChildFactory()
+            self.run_with(factory, [*self.arguments(directory), *settings])
+            first = factory.commands[0]
+            self.assertEqual(option(first, "--replay-storage"), "frames")
+            self.assertIn("--terminal-on-life-loss", first)
+            self.assertEqual(option(first, "--buffer-capacity"), "200000")
+            self.assertEqual(option(first, "--epsilon-decay-steps"), "1000000")
+            self.assertEqual(float(option(first, "--lr")), 5e-5)
+            resume = ["--run-dir", str(directory), "--resume-experiment"]
+            parsed = experiment.parse_args(resume)
+            self.assertEqual(parsed.buffer_capacity, 200_000)
+            self.assertTrue(parsed.terminal_on_life_loss)
+            for override in (["--replay-storage", "deque"], ["--no-terminal-on-life-loss"],
+                             ["--buffer-capacity", "50000"], ["--epsilon-decay-steps", "250000"],
+                             ["--lr", "0.0001"]):
+                with self.subTest(override=override), self.assertRaises(SystemExit):
+                    experiment.parse_args([*resume, *override])
+
+    def test_changed_checkpoint_training_settings_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            checkpoint = directory / "model.training.pt"
+            saved = json.loads(checkpoint.read_text())
+            for name, value in (("replay_storage", "frames"), ("terminal_on_life_loss", True),
+                                ("buffer_capacity", 200000), ("epsilon_decay_steps", 1000000), ("lr", 5e-5)):
+                with self.subTest(name=name):
+                    checkpoint.write_text(json.dumps({**saved, name: value}))
+                    factory = ChildFactory()
+                    with self.assertRaisesRegex(ValueError, "training settings"):
+                        self.run_with(factory, ["--run-dir", str(directory), "--resume-experiment"])
+                    self.assertEqual(factory.commands, [])
+
+    def test_missing_new_fields_resume_with_legacy_training_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            for path in (directory / "experiment.config.json", directory / "model.training.pt",
+                         *directory.glob("model.step-*.config.json")):
+                saved = json.loads(path.read_text())
+                for name in experiment.TRAINING_DEFAULTS:
+                    saved.pop(name, None)
+                path.write_text(json.dumps(saved))
+            factory = ChildFactory()
+            self.run_with(factory, ["--run-dir", str(directory), "--resume-experiment"])
+            self.assertEqual(factory.commands, [])
 
     def test_surviving_child_blocks_resume_without_touching_progress_or_config(self):
         with tempfile.TemporaryDirectory() as directory:

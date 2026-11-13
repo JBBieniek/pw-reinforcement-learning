@@ -26,6 +26,10 @@ SUMMARY_FIELDS = (
     "mean_reward", "median_reward", "min_reward", "max_reward", "std_reward",
     "wins_864", "win_rate_864", "hit_step_limit", "mean_steps", "episodes",
 )
+TRAINING_DEFAULTS = {
+    "replay_storage": "deque", "terminal_on_life_loss": False,
+    "buffer_capacity": 50_000, "epsilon_decay_steps": 250_000, "lr": 1e-4,
+}
 
 
 def _timestamp():
@@ -76,6 +80,12 @@ def parse_args(argv=None):
     parser.add_argument("--algorithm", choices=["dqn", "double-dqn"], default="double-dqn")
     parser.add_argument("--activation", choices=["relu", "leaky-relu"], default="leaky-relu")
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--replay-storage", choices=["deque", "frames"], default="deque")
+    parser.add_argument("--terminal-on-life-loss", action=argparse.BooleanOptionalAction, default=False,
+                        help="Mask the training TD target on life loss; evaluation remains full-game")
+    parser.add_argument("--buffer-capacity", type=int, default=50_000)
+    parser.add_argument("--epsilon-decay-steps", type=int, default=250_000)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--milestones", type=_milestones, default=_milestones(DEFAULT_MILESTONES))
     parser.add_argument("--append-milestones", type=_milestones,
                         help="Append later evaluation budgets to a completed experiment")
@@ -110,12 +120,12 @@ def parse_args(argv=None):
             parser.error(str(error))
         args.previous_targets = list(previous_targets)
         args.milestone_extensions = list(extension_history)
-        legacy_defaults = {"activation": "relu", "deterministic": False}
+        legacy_defaults = {"activation": "relu", "deterministic": False, **TRAINING_DEFAULTS}
         for name in ("algorithm", "activation", "deterministic", "milestones", "seed",
-                     "eval_seed", "eval_episodes", "max_steps"):
+                     "eval_seed", "eval_episodes", "max_steps", *TRAINING_DEFAULTS):
             option = "--" + name.replace("_", "-")
             saved_value = saved.get(name, legacy_defaults[name]) if name in legacy_defaults else saved[name]
-            explicitly_supplied = option in supplied or (name == "deterministic" and "--no-deterministic" in supplied)
+            explicitly_supplied = option in supplied or "--no-" + name.replace("_", "-") in supplied
             if explicitly_supplied and getattr(args, name) != saved_value:
                 parser.error(f"{option} differs from the saved experiment ({saved_value!r})")
             setattr(args, name, saved_value)
@@ -143,6 +153,10 @@ def parse_args(argv=None):
         parser.error("seeds must be between 0 and 4294967295")
     if args.eval_episodes <= 0 or args.max_steps <= 0:
         parser.error("--eval-episodes and --max-steps must be positive")
+    if args.buffer_capacity < 20_000 or args.epsilon_decay_steps <= 0:
+        parser.error("--buffer-capacity must be at least 20000 and --epsilon-decay-steps positive")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--lr must be finite and positive")
     if not math.isfinite(args.max_steps_per_second) or args.max_steps_per_second < 0:
         parser.error("--max-steps-per-second must be finite and non-negative")
     return args
@@ -189,6 +203,8 @@ def _read_training_checkpoint(path):
               "seed": saved["config"]["seed"], "steps": saved["config"]["steps"],
               "activation": saved["config"].get("activation", "relu"),
               "deterministic": saved["config"].get("deterministic", False)}
+    result.update({name: saved["config"].get(name, default)
+                   for name, default in TRAINING_DEFAULTS.items()})
     # Never retain the multi-GB replay while starting the next training child.
     del saved
     gc.collect()
@@ -203,6 +219,9 @@ def _validated_checkpoint(path, args):
             or saved.get("activation", "relu") != args.activation
             or saved.get("deterministic", False) is not args.deterministic):
         raise ValueError("training checkpoint does not match this experiment")
+    if any(saved.get(name, default) != getattr(args, name, default)
+           for name, default in TRAINING_DEFAULTS.items()):
+        raise ValueError("training checkpoint does not match this experiment's training settings")
     if saved["step"] > saved["steps"] or saved["step"] > args.milestones[-1]:
         raise ValueError("training checkpoint exceeds the experiment target")
     return saved["step"]
@@ -265,6 +284,9 @@ def _evaluation_report(path, weights, milestone, args, *, cached):
                                 ("mode", "difficulty", "frame_skip", "sticky_action_probability")}
         expected_activation = training.get("activation", "relu")
         expected_deterministic = training.get("deterministic", False)
+        if any(training.get(name, default) != getattr(args, name, default)
+               for name, default in TRAINING_DEFAULTS.items()):
+            return None
         expected_seeds = [(args.eval_seed + index) % 2**32 for index in range(args.eval_episodes)]
         if (not report.get("completed_at_utc")
                 or expected_activation != args.activation
@@ -309,8 +331,8 @@ def _write_comparison(directory, results):
     os.replace(temporary, path)
 
 
-def _run_child(command, update):
-    process = subprocess.Popen(command, cwd=ROOT)
+def _run_child(command, update, *, cwd=None):
+    process = subprocess.Popen(command, cwd=ROOT if cwd is None else cwd)
     try:
         update(child_pid=process.pid, child_cleanup=None)
         returncode = process.wait()
@@ -337,6 +359,7 @@ def run_experiment(argv=None):
         "status": "starting", "pid": os.getpid(), "child_pid": None, "child_cleanup": None,
         "algorithm": args.algorithm, "seed": args.seed, "device": args.device,
         "activation": args.activation, "deterministic": args.deterministic,
+        "training_settings": {name: getattr(args, name) for name in TRAINING_DEFAULTS},
         "milestones": args.milestones, "current_milestone": None,
         "next_milestone": args.milestones[0],
         "completed_milestones": [], "results": [], "error": None,
@@ -390,6 +413,12 @@ def run_experiment(argv=None):
             raise ValueError("run directory already contains an experiment; use --resume-experiment")
         config = {key: value for key, value in vars(args).items()
                   if not key.startswith("_") and key not in ("resume_experiment", "append_milestones")}
+        # Existing continuation requests identify the original configuration
+        # exactly. Do not add redundant default fields to legacy configurations.
+        if args.resume_experiment:
+            for name, default in TRAINING_DEFAULTS.items():
+                if name not in args._saved_config and getattr(args, name) == default:
+                    config.pop(name)
         config["format_version"] = 1
         _write_json(config_path, config)
         update()
@@ -407,7 +436,7 @@ def run_experiment(argv=None):
                 if report is None:
                     if saved_step < milestone:
                         update(status="training", current_milestone=milestone)
-                        command = [sys.executable, "-u", "-m", "experiments.ConceptCheck.train",
+                        command = [sys.executable, "-B", "-u", "-m", "experiments.ConceptCheck.train",
                                    "--steps", str(args.milestones[-1]), "--stop-at", str(milestone),
                                    "--activation", args.activation,
                                    "--deterministic" if args.deterministic else "--no-deterministic",
@@ -419,6 +448,11 @@ def run_experiment(argv=None):
                         else:
                             command += ["--algorithm", args.algorithm, "--seed", str(args.seed),
                                         "--save-path", str(directory / "model.pth")]
+                            for name in TRAINING_DEFAULTS:
+                                value = getattr(args, name)
+                                option = "--" + name.replace("_", "-")
+                                command += ([option if value else "--no-terminal-on-life-loss"]
+                                            if name == "terminal_on_life_loss" else [option, str(value)])
                         print(f"Training {args.algorithm} to {milestone:,} decisions", flush=True)
                         _run_child(command, update)
                         saved_step = _validated_checkpoint(checkpoint, args)
@@ -427,7 +461,7 @@ def run_experiment(argv=None):
                     if not weights.is_file():
                         raise FileNotFoundError(f"milestone weights are missing: {weights}")
                     update(status="evaluating", current_milestone=milestone)
-                    command = [sys.executable, "-u", "-m", "experiments.ConceptCheck.test",
+                    command = [sys.executable, "-B", "-u", "-m", "experiments.ConceptCheck.test",
                                "--model-path", str(weights), "--episodes", str(args.eval_episodes),
                                "--activation", args.activation,
                                "--deterministic" if args.deterministic else "--no-deterministic",

@@ -18,15 +18,19 @@ if __package__:
     from .health import HealthMonitor, RepresentationCollapseError
     from .run_logging import TrainingRun
     from .pacing import StepPacer
+    from .replay import FrameReplayBuffer
     from .checkpoints import (load_training_checkpoint, restore_training_checkpoint,
                               save_training_checkpoint, training_checkpoint_path)
 else:
+    # Keep pickled replay classes importable from module and script entry points.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from dqn import compute_td_targets
     from neural_network import BreakoutBasicNetwork, configure_activation, make_breakout_env
     from runtime import configure_determinism
     from health import HealthMonitor, RepresentationCollapseError
     from run_logging import TrainingRun
     from pacing import StepPacer
+    from experiments.ConceptCheck.replay import FrameReplayBuffer
     from checkpoints import (load_training_checkpoint, restore_training_checkpoint,
                              save_training_checkpoint, training_checkpoint_path)
 
@@ -60,6 +64,8 @@ def parse_args(argv=None):
     parser.add_argument("--epsilon-end", type=float, default=0.1, help="Final exploration rate")
     parser.add_argument("--epsilon-decay-steps", type=int, default=250_000, help="Steps over which epsilon decays")
     parser.add_argument("--buffer-capacity", type=int, default=50_000, help="Replay buffer max capacity")
+    parser.add_argument("--replay-storage", choices=["deque", "frames"], default="deque", help="Uniform replay storage; frames shares overlapping observation frames")
+    parser.add_argument("--terminal-on-life-loss", action=argparse.BooleanOptionalAction, default=False, help="Mask the training TD bootstrap after a lost life, without resetting the full game")
     parser.add_argument("--min-replay-size", type=int, default=20_000, help="Minimum transitions before training")
     parser.add_argument("--target-update-freq", type=int, default=10_000, help="Frequency of target net update (steps)")
     parser.add_argument("--save-freq", type=int, default=25_000, help="Checkpoint save frequency (steps)")
@@ -85,12 +91,15 @@ def parse_args(argv=None):
             "sticky_action_probability", "train_freq", "batch_size", "lr", "gamma",
             "epsilon_start", "epsilon_end", "epsilon_decay_steps", "buffer_capacity",
             "min_replay_size", "target_update_freq", "activation", "deterministic",
+            "replay_storage", "terminal_on_life_loss",
         )
-        legacy_defaults = {"activation": "relu", "deterministic": False}
+        legacy_defaults = {"activation": "relu", "deterministic": False,
+                           "replay_storage": "deque", "terminal_on_life_loss": False}
         for name in fixed:
             option = "--" + name.replace("_", "-")
             value = saved[name] if name in saved else legacy_defaults[name]
-            explicit = option in supplied or (name == "deterministic" and "--no-deterministic" in supplied)
+            explicit = option in supplied or (name in ("deterministic", "terminal_on_life_loss")
+                                              and "--no-" + name.replace("_", "-") in supplied)
             if explicit and getattr(args, name) != value:
                 parser.error(f"{option} differs from the training checkpoint ({value!r})")
             setattr(args, name, value)
@@ -168,10 +177,12 @@ def train(argv=None):
     optimizer = torch.optim.Adam(policy_net.parameters(), lr=args.lr)
     loss_fn = nn.SmoothL1Loss()
 
-    replay_buffer = deque(maxlen=args.buffer_capacity)
+    replay_buffer = (FrameReplayBuffer(args.buffer_capacity) if args.replay_storage == "frames"
+                     else deque(maxlen=args.buffer_capacity))
 
-    state, _ = env.reset(seed=args.seed)
+    state, reset_info = env.reset(seed=args.seed)
     state = np.array(state)
+    previous_lives = reset_info.get("lives")
 
     epsilon = args.epsilon_start
     recent_loss = 0.0
@@ -196,11 +207,15 @@ def train(argv=None):
         episodes_completed = restored["episodes_completed"]
         recent_loss = restored["recent_loss"]
         elapsed_seconds = restored.get("elapsed_seconds", 0.0)
+        previous_lives = restored.get("previous_lives")
         health.set_state(restored.get("health_state", {}))
         print(f"Resumed step {step}; replay={len(replay_buffer)}; "
               f"game restored={restored['environment_restored']}; "
               f"exact trajectory={restored['environment_restore_exact']}")
         del restored, resume_state
+    if args.terminal_on_life_loss and previous_lives is None:
+        env.close()
+        raise ValueError("--terminal-on-life-loss requires the environment's lives counter")
     run = TrainingRun(args, device, start_step=step, elapsed_seconds=elapsed_seconds)
     end_step = min(args.steps, args.stop_at) if args.stop_at is not None else args.steps
     status = "paused" if end_step < args.steps else "completed"
@@ -230,6 +245,7 @@ def train(argv=None):
             last_episode_reward=last_episode_reward, episodes_completed=episodes_completed,
             recent_loss=recent_loss, env=env, elapsed_seconds=run.elapsed_seconds(),
             health_state=health.get_state(),
+            previous_lives=previous_lives,
         )
         milestone = Path(args.save_path).with_name(f"{Path(args.save_path).stem}.step-{step:09d}.pth")
         save_weights(milestone)
@@ -248,22 +264,31 @@ def train(argv=None):
                     q_values = policy_net(state_tensor)
                     action = q_values.argmax(dim=1).item()
 
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
             next_state = np.array(next_state)
             done = terminated or truncated
+            lives = info.get("lives")
+            if args.terminal_on_life_loss and lives is None:
+                raise ValueError("The environment stopped reporting its lives counter")
+            life_lost = bool(args.terminal_on_life_loss and lives < previous_lives)
+            learning_terminal = bool(terminated or life_lost)
 
             episode_reward += reward
             # Truncation resets the environment but must not mask bootstrapping.
-            replay_buffer.append((state, action, reward, next_state, terminated))
+            # The opt-in life-loss variant changes only this TD mask. Scores,
+            # game resets and observation stacking still cover the full game.
+            replay_buffer.append((state, action, reward, next_state, learning_terminal))
 
             if done:
-                state, _ = env.reset()
+                state, reset_info = env.reset()
                 state = np.array(state)
+                previous_lives = reset_info.get("lives")
                 last_episode_reward = episode_reward
                 episode_reward = 0.0
                 episodes_completed += 1
             else:
                 state = next_state
+                previous_lives = lives
 
             # Epsilon linear decay
             if next_step <= args.epsilon_decay_steps:
@@ -273,7 +298,9 @@ def train(argv=None):
 
             # Gradient descent step
             if len(replay_buffer) >= args.min_replay_size and next_step % args.train_freq == 0:
-                batch = random.sample(replay_buffer, args.batch_size)
+                batch = (replay_buffer.sample(args.batch_size)
+                         if isinstance(replay_buffer, FrameReplayBuffer)
+                         else random.sample(replay_buffer, args.batch_size))
                 b_states, b_actions, b_rewards, b_next_states, b_terminated = zip(*batch)
 
                 b_states = torch.from_numpy(np.array(b_states)).to(device)

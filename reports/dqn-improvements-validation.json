@@ -1,0 +1,26 @@
+{
+  "status": "passed",
+  "unit_tests": 150,
+  "gpu_smoke_variants": [
+    "control",
+    "life_loss",
+    "replay200k",
+    "slow_exploration"
+  ],
+  "gpu_smoke_milestones": [
+    20000,
+    24000
+  ],
+  "gpu_repeated_continuations": [
+    24000,
+    28000
+  ],
+  "repeatable_from_same_checkpoint": true,
+  "frozen_source_smoke_milestones": [
+    500,
+    1000
+  ],
+  "frozen_source_smoke_status": "completed",
+  "scope": "Engineering checks only; no claim of improved score or exact uninterrupted sticky-action trajectory",
+  "details_directory": "outputs/improvements-validation-20261113"
+}

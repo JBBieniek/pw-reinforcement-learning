@@ -27,6 +27,8 @@ python -m experiments.ConceptCheck.experiment --algorithm dqn --device cuda --se
 python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-stable-15m --resume-experiment
 python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-stable-15m --resume-experiment --append-milestones 20000000,25000000 --max-steps-per-second 0
 python -m experiments.ConceptCheck.test --model-path outputs/ddqn-stable-15m/model.step-010000000.pth --episodes 100 --seed 3303497698
+python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pilot
+python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pilot --resume
 python -m unittest discover -s tests -v
 ```
 
@@ -48,3 +50,9 @@ Nowe treningi używają LeakyReLU i deterministycznych operacji; obie metody mus
 mieć te same ustawienia. Stare modele zachowują ReLU. Kopiuj wagi razem z `.config.json`.
 `model.health.json`/`.jsonl` pokazują cechy obrazu i gradienty; wykryte zapadnięcie
 zatrzymuje trening z zapisem diagnostycznym. Krótki test nie gwarantuje wyniku po 15 mln.
+
+Pilot uruchamia kolejno cztery Double DQN po 2 mln decyzji, z oceną 100 pełnych gier
+przy 1 i 2 mln: kontrolny, maskowanie celu TD po utracie życia, bufor 200 tys.
+i spadek epsilona przez 1 mln. Każdy zmienia jedną rzecz i używa wspólnego seedu
+oraz oszczędnego bufora klatek (`--replay-storage frames`). Wyniki trafiają do
+`comparison.csv`; to wstępna selekcja ustawień, a nie dowód przewagi z jednego treningu.
