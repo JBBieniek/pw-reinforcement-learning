@@ -1,0 +1,28 @@
+{
+  "algorithm": "double-dqn",
+  "target_decisions": 50000000,
+  "evaluation_interval": 1000000,
+  "evaluation_episodes": 100,
+  "training_seed": 230849415,
+  "evaluation_seed": 3303497698,
+  "recipe": {
+    "replay_storage": "frames",
+    "terminal_on_life_loss": true,
+    "buffer_capacity": 200000,
+    "epsilon_decay_steps": 1000000
+  },
+  "preflight": {
+    "status": "passed",
+    "completed_milestones": [
+      24000,
+      28000
+    ],
+    "health": "healthy",
+    "learning_terminals": 752,
+    "completed_full_games": 150,
+    "resume_checked": true
+  },
+  "source_zip_sha256": "5d63fc55aeac76d5eb031db75a3d014e3879b31fc5103c14143510cbc8f43dfc",
+  "output_directory": "outputs/ddqn-combined-50m",
+  "baseline_results": "reports/ddqn-baseline-25m.csv"
+}

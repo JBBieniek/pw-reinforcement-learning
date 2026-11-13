@@ -29,6 +29,8 @@ python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-stable-15m 
 python -m experiments.ConceptCheck.test --model-path outputs/ddqn-stable-15m/model.step-010000000.pth --episodes 100 --seed 3303497698
 python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pilot
 python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pilot --resume
+$milestones = (1..50 | ForEach-Object { $_ * 1000000 }) -join ','
+python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-combined-50m --milestones $milestones --replay-storage frames --terminal-on-life-loss --buffer-capacity 200000 --epsilon-decay-steps 1000000 --max-steps-per-second 0
 python -m unittest discover -s tests -v
 ```
 
@@ -56,3 +58,5 @@ przy 1 i 2 mln: kontrolny, maskowanie celu TD po utracie życia, bufor 200 tys.
 i spadek epsilona przez 1 mln. Każdy zmienia jedną rzecz i używa wspólnego seedu
 oraz oszczędnego bufora klatek (`--replay-storage frames`). Wyniki trafiają do
 `comparison.csv`; to wstępna selekcja ustawień, a nie dowód przewagi z jednego treningu.
+Wariant `ddqn-combined-50m` łączy trzy zmiany w jednym Double DQN. Każdy milion
+decyzji kończy się oceną 100 gier; wynik poprzedniego treningu jest w `reports/`.
