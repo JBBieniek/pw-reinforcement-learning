@@ -30,10 +30,14 @@ else:
 
 
 FORMAT_VERSION = 1
+_RALLY_WRAPPER = "experiments.ConceptCheck.rewards.RallyRewardTracker"
 
 # Fields that affect the next observation or the next environment reset. Static
 # wrapper settings are checked separately so incompatible environments fail early.
 _WRAPPER_FIELDS = {
+    _RALLY_WRAPPER: (
+        (), ("bounce_bonus", "rally_bonus_step", "rally_bonus_max_multiplier", "detector_version"),
+    ),
     "gymnasium.wrappers.stateful_observation.FrameStackObservation": (
         ("padding_value", "obs_queue", "stacked_obs"),
         ("stack_size", "padding_type"),
@@ -106,7 +110,9 @@ def _ale_settings(base):
 def _capture_environment(env):
     spaces = _space_rngs(env)
     # A custom protocol owns the entire environment, including custom wrappers.
-    if callable(getattr(env, "get_state", None)) and callable(getattr(env, "set_state", None)):
+    if (_class_name(env) != _RALLY_WRAPPER
+            and callable(getattr(env, "get_state", None))
+            and callable(getattr(env, "set_state", None))):
         return {
             "kind": "protocol", "class": _class_name(env),
             "state": deepcopy(env.get_state()), "spaces": spaces,
@@ -127,10 +133,13 @@ def _capture_environment(env):
     wrappers = []
     for layer in layers[:-1]:
         state_fields, settings = _WRAPPER_FIELDS[_class_name(layer)]
+        state = deepcopy({name: vars(layer)[name] for name in state_fields
+                          if name in vars(layer)})
+        if _class_name(layer) == _RALLY_WRAPPER:
+            state["rally_tracker"] = deepcopy(layer.get_state())
         wrappers.append({
             "class": _class_name(layer),
-            "state": deepcopy({name: vars(layer)[name] for name in state_fields
-                               if name in vars(layer)}),
+            "state": state,
             "settings": deepcopy({name: vars(layer)[name] for name in settings}),
         })
     return {
@@ -177,7 +186,10 @@ def _restore_environment(env, saved):
         base.__dict__["_np_random"] = deepcopy(saved["np_random"])
         base.__dict__["_np_random_seed"] = saved["np_random_seed"]
         for layer, wrapper in zip(layers[:-1], saved["wrappers"]):
-            vars(layer).update(deepcopy(wrapper["state"]))
+            if wrapper["class"] == _RALLY_WRAPPER:
+                layer.set_state(deepcopy(wrapper["state"]["rally_tracker"]))
+            else:
+                vars(layer).update(deepcopy(wrapper["state"]))
     else:
         raise ValueError(f"Unsupported checkpoint environment kind: {kind!r}")
     _restore_space_rngs(env, saved["spaces"])
@@ -228,7 +240,8 @@ def _restore_rng(saved):
 def save_training_checkpoint(path, *, args, policy_net, target_net, optimizer,
                              replay_buffer, state, step, epsilon, episode_reward,
                              last_episode_reward, episodes_completed, recent_loss, env,
-                             elapsed_seconds=0.0, health_state=None, previous_lives=None):
+                             elapsed_seconds=0.0, health_state=None, previous_lives=None,
+                             reward_state=None):
     """Atomically replace the one full snapshot without duplicating replay RAM.
 
     Call between completed environment/optimizer steps. Pickle memoization keeps
@@ -248,6 +261,7 @@ def save_training_checkpoint(path, *, args, policy_net, target_net, optimizer,
         "elapsed_seconds": elapsed_seconds,
         "health_state": deepcopy(health_state or {}),
         "previous_lives": previous_lives,
+        "reward_state": deepcopy(reward_state or {}),
         "environment": _capture_environment(env), "rng": _capture_rng(),
     }
     _validate_checkpoint(payload)
@@ -298,6 +312,23 @@ def _validate_checkpoint(checkpoint):
         raise ValueError("Training checkpoint replay capacity differs from its configuration")
     if checkpoint["config"].get("terminal_on_life_loss", False) and checkpoint.get("previous_lives") is None:
         raise ValueError("Life-loss training checkpoint is missing its lives counter")
+    shaping = checkpoint["config"].get("reward_shaping", "none")
+    if shaping not in ("none", "rally"):
+        raise ValueError("Training checkpoint has an unknown reward shaping mode")
+    if shaping == "rally":
+        counters = checkpoint.get("reward_state", {})
+        required_counters = {
+            "episode_bonus", "last_episode_bonus", "episode_bounces", "last_episode_bounces",
+            "total_bonus", "total_bounces", "tracker_bonus_total", "tracker_bounces_total",
+        }
+        if not isinstance(counters, dict) or not required_counters <= counters.keys():
+            raise ValueError("Rally training checkpoint is missing reward counters")
+        if any(not isinstance(counters[name], (int, float)) or isinstance(counters[name], bool)
+               or not np.isfinite(counters[name]) or counters[name] < 0 for name in required_counters):
+            raise ValueError("Rally training checkpoint has invalid reward counters")
+        for name in ("episode_bounces", "last_episode_bounces", "total_bounces", "tracker_bounces_total"):
+            if type(counters[name]) is not int:
+                raise ValueError("Rally training checkpoint has a non-integer bounce counter")
     if not isinstance(checkpoint["environment"], dict) or "kind" not in checkpoint["environment"]:
         raise ValueError("Invalid environment state in training checkpoint")
 
@@ -344,6 +375,7 @@ def restore_training_checkpoint(checkpoint, *, policy_net, target_net, optimizer
         result["state"] = np.array(state)
         result["previous_lives"] = info.get("lives")
         result["episode_reward"] = 0.0
+        result["reset_info"] = info
         _restore_space_rngs(env, checkpoint["environment"]["spaces"])
     _restore_rng(checkpoint["rng"])
     return result

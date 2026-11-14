@@ -74,7 +74,7 @@ class TrainingRun:
         return self.elapsed_offset + time.perf_counter() - self.started
 
     def record(self, step, loss, epsilon, buffer_size, episodes, last_reward,
-               status="running", error=None):
+               status="running", error=None, reward_metrics=None):
         now = time.perf_counter()
         timestamp = datetime.now(timezone.utc)
         if self.last_step >= self.args.min_replay_size and step > self.last_step:
@@ -100,6 +100,8 @@ class TrainingRun:
             "last_episode_reward": last_reward,
             "error": error,
         }
+        if reward_metrics is not None:
+            data.update(reward_metrics)
         write_json(self.progress_path, data)
         with self.metrics_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(data))

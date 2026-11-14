@@ -31,6 +31,7 @@ python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pil
 python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pilot --resume
 $milestones = (1..50 | ForEach-Object { $_ * 1000000 }) -join ','
 python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-combined-50m --milestones $milestones --replay-storage frames --terminal-on-life-loss --buffer-capacity 200000 --epsilon-decay-steps 1000000 --max-steps-per-second 0
+python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-revision-2 --milestones $milestones --algorithm double-dqn --lr 0.00005 --buffer-capacity 500000 --gamma 0.995 --train-freq 2 --reward-shaping rally --bounce-bonus 1 --rally-bonus-step 0.2 --rally-bonus-max-multiplier 2 --replay-storage frames --terminal-on-life-loss --epsilon-decay-steps 1000000 --max-steps-per-second 0
 python -m experiments.ConceptCheck.metrics --run-dir outputs/ddqn-combined-50m --output-prefix reports/ddqn-combined-50m-metrics
 python -m unittest discover -s tests -v
 ```
@@ -63,3 +64,12 @@ Wariant `ddqn-combined-50m` łączy trzy zmiany w jednym Double DQN. Każdy mili
 decyzji kończy się oceną 100 gier; wynik poprzedniego treningu jest w `reports/`.
 `metrics` zbiera ukończone oceny co milion i zapisuje CSV oraz wykres PNG/SVG.
 Pokazuje średnią, medianę, maksimum i przedział 25–75% wyników gier.
+
+Rewizja 2 zmienia LR, bufor, gamma, częstotliwość uczenia i dodaje ograniczony bonus.
+Odbicie paletką daje `1`; punkty zdobyte do następnego odbicia podnoszą sumę bonusu
+o `0,2` za punkt, najwyżej do `2`. Dopłacana jest tylko różnica. Prawdziwe punkty
+pozostają osobnym składnikiem nagrody i podstawą ocen. Nie ma PER, n-step ani dueling.
+Użyj nowego katalogu wyników; parametry i stan bonusu są zachowywane przy wznowieniu.
+Detektor obserwuje natywne klatki RGB; CNN nadal dostaje cztery obrazy 84×84.
+Licznik bonusu zależy od historii wymiany i nie jest dodatkowym wejściem CNN.
+To eksperymentalna zmiana nagród; poprawę oceniamy po prawdziwych punktach.

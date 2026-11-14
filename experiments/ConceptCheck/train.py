@@ -60,6 +60,12 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for gradient descent")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--reward-shaping", choices=["none", "rally"], default="none",
+                        help="Optional bounded paddle/rally bonus; game scores remain raw")
+    parser.add_argument("--bounce-bonus", type=float, default=1.0, help="Bonus per detected paddle bounce")
+    parser.add_argument("--rally-bonus-step", type=float, default=0.2, help="Multiplier increment per raw rally point")
+    parser.add_argument("--rally-bonus-max-multiplier", type=float, default=2.0,
+                        help="Cap on the entire rally bonus, as a multiple of --bounce-bonus")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial exploration rate")
     parser.add_argument("--epsilon-end", type=float, default=0.1, help="Final exploration rate")
     parser.add_argument("--epsilon-decay-steps", type=int, default=250_000, help="Steps over which epsilon decays")
@@ -92,9 +98,12 @@ def parse_args(argv=None):
             "epsilon_start", "epsilon_end", "epsilon_decay_steps", "buffer_capacity",
             "min_replay_size", "target_update_freq", "activation", "deterministic",
             "replay_storage", "terminal_on_life_loss",
+            "reward_shaping", "bounce_bonus", "rally_bonus_step", "rally_bonus_max_multiplier",
         )
         legacy_defaults = {"activation": "relu", "deterministic": False,
-                           "replay_storage": "deque", "terminal_on_life_loss": False}
+                           "replay_storage": "deque", "terminal_on_life_loss": False,
+                           "reward_shaping": "none", "bounce_bonus": 1.0,
+                           "rally_bonus_step": 0.2, "rally_bonus_max_multiplier": 2.0}
         for name in fixed:
             option = "--" + name.replace("_", "-")
             value = saved[name] if name in saved else legacy_defaults[name]
@@ -125,6 +134,12 @@ def parse_args(argv=None):
         parser.error("require 0 <= --epsilon-end <= --epsilon-start <= 1")
     if not args.lr > 0.0 or not np.isfinite(args.lr):
         parser.error("--lr must be finite and positive")
+    for name, minimum in (("bounce_bonus", 0.0), ("rally_bonus_step", 0.0),
+                          ("rally_bonus_max_multiplier", 1.0)):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) < minimum:
+            parser.error(f"--{name.replace('_', '-')} must be finite and at least {minimum}")
+    if not np.isfinite(args.bounce_bonus * args.rally_bonus_max_multiplier):
+        parser.error("maximum rally bonus must be finite")
     if not np.isfinite(args.max_steps_per_second) or args.max_steps_per_second < 0:
         parser.error("--max-steps-per-second must be finite and non-negative")
     if args.save_path is None:
@@ -158,12 +173,16 @@ def train(argv=None):
     os.makedirs(os.path.dirname(os.path.abspath(args.save_path)), exist_ok=True)
 
     render_mode = "human" if args.render else None
+    reward_options = ({name: getattr(args, name) for name in (
+        "reward_shaping", "bounce_bonus", "rally_bonus_step", "rally_bonus_max_multiplier",
+    )} if args.reward_shaping == "rally" else {})
     env = make_breakout_env(
         render_mode=render_mode,
         mode=args.mode,
         difficulty=args.difficulty,
         frame_skip=args.frame_skip,
         sticky_action_probability=args.sticky_action_probability,
+        **reward_options,
     )
     env.action_space.seed(args.seed)
 
@@ -189,6 +208,26 @@ def train(argv=None):
     episode_reward = 0.0
     last_episode_reward = 0.0
     episodes_completed = 0
+    reward_state = {
+        "episode_bonus": 0.0, "last_episode_bonus": 0.0,
+        "episode_bounces": 0, "last_episode_bounces": 0,
+        "total_bonus": 0.0, "total_bounces": 0,
+        "tracker_bonus_total": 0.0, "tracker_bounces_total": 0,
+    }
+
+    def set_reward_baseline(info):
+        if args.reward_shaping == "rally":
+            totals = info.get("rally_reward")
+            if not isinstance(totals, dict):
+                raise ValueError("Rally reward tracking information is missing")
+            reward_state["tracker_bonus_total"] = float(totals["bonus_total"])
+            reward_state["tracker_bounces_total"] = int(totals["bounces_total"])
+
+    try:
+        set_reward_baseline(reset_info)
+    except Exception:
+        env.close()
+        raise
 
     step = 0
     elapsed_seconds = 0.0
@@ -208,6 +247,11 @@ def train(argv=None):
         recent_loss = restored["recent_loss"]
         elapsed_seconds = restored.get("elapsed_seconds", 0.0)
         previous_lives = restored.get("previous_lives")
+        reward_state.update(restored.get("reward_state", {}))
+        if not restored["environment_restored"]:
+            reward_state["episode_bonus"] = 0.0
+            reward_state["episode_bounces"] = 0
+            set_reward_baseline(restored.get("reset_info", {}))
         health.set_state(restored.get("health_state", {}))
         print(f"Resumed step {step}; replay={len(replay_buffer)}; "
               f"game restored={restored['environment_restored']}; "
@@ -223,9 +267,26 @@ def train(argv=None):
     step_in_progress = False
     last_full_step = None
     last_training_states = None
-    run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed, last_episode_reward)
     pbar = tqdm(range(step + 1, end_step + 1), desc=f"Training {algorithm_name}", unit="step", disable=not os.isatty(2))
     pacer = StepPacer(args.max_steps_per_second)
+
+    def reward_metrics():
+        if args.reward_shaping != "rally":
+            return None
+        return {
+            "episode_raw_reward": episode_reward,
+            "episode_bonus": reward_state["episode_bonus"],
+            "episode_training_reward": episode_reward + reward_state["episode_bonus"],
+            "last_episode_bonus": reward_state["last_episode_bonus"],
+            "last_episode_training_reward": last_episode_reward + reward_state["last_episode_bonus"],
+            "episode_bounces": reward_state["episode_bounces"],
+            "last_episode_bounces": reward_state["last_episode_bounces"],
+            "total_bonus": reward_state["total_bonus"],
+            "total_bounces": reward_state["total_bounces"],
+        }
+
+    run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed,
+               last_episode_reward, reward_metrics=reward_metrics())
 
     def save_weights(path):
         path = Path(path)
@@ -246,6 +307,7 @@ def train(argv=None):
             recent_loss=recent_loss, env=env, elapsed_seconds=run.elapsed_seconds(),
             health_state=health.get_state(),
             previous_lives=previous_lives,
+            reward_state=reward_state,
         )
         milestone = Path(args.save_path).with_name(f"{Path(args.save_path).stem}.step-{step:09d}.pth")
         save_weights(milestone)
@@ -274,16 +336,36 @@ def train(argv=None):
             learning_terminal = bool(terminated or life_lost)
 
             episode_reward += reward
+            bonus = 0.0
+            if args.reward_shaping == "rally":
+                totals = info.get("rally_reward")
+                if not isinstance(totals, dict):
+                    raise ValueError("Rally reward tracking information is missing")
+                bonus = float(totals["bonus_total"]) - reward_state["tracker_bonus_total"]
+                bounces = int(totals["bounces_total"]) - reward_state["tracker_bounces_total"]
+                if not np.isfinite(bonus) or bonus < -1e-9 or bounces < 0:
+                    raise ValueError("Rally reward counters moved backwards or became non-finite")
+                bonus = max(0.0, bonus)
+                reward_state["episode_bonus"] += bonus
+                reward_state["total_bonus"] += bonus
+                reward_state["episode_bounces"] += bounces
+                reward_state["total_bounces"] += bounces
+                set_reward_baseline(info)
             # Truncation resets the environment but must not mask bootstrapping.
             # The opt-in life-loss variant changes only this TD mask. Scores,
             # game resets and observation stacking still cover the full game.
-            replay_buffer.append((state, action, reward, next_state, learning_terminal))
+            replay_buffer.append((state, action, float(reward) + bonus, next_state, learning_terminal))
 
             if done:
                 state, reset_info = env.reset()
                 state = np.array(state)
                 previous_lives = reset_info.get("lives")
+                set_reward_baseline(reset_info)
                 last_episode_reward = episode_reward
+                reward_state["last_episode_bonus"] = reward_state["episode_bonus"]
+                reward_state["last_episode_bounces"] = reward_state["episode_bounces"]
+                reward_state["episode_bonus"] = 0.0
+                reward_state["episode_bounces"] = 0
                 episode_reward = 0.0
                 episodes_completed += 1
             else:
@@ -351,7 +433,8 @@ def train(argv=None):
                 save_full_state()
 
             if step % args.log_freq == 0:
-                run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed, last_episode_reward)
+                run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed,
+                           last_episode_reward, reward_metrics=reward_metrics())
                 print(f"step={step}/{args.steps} loss={recent_loss:.5f} epsilon={epsilon:.3f} episodes={episodes_completed} last_reward={last_episode_reward}", flush=True)
 
             # Update progress bar metrics
@@ -392,7 +475,8 @@ def train(argv=None):
                 error = repr(exc)
                 raise
             finally:
-                run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed, last_episode_reward, status, error)
+                run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed,
+                           last_episode_reward, status, error, reward_metrics=reward_metrics())
 
 
 if __name__ == "__main__":

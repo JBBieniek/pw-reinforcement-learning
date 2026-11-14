@@ -53,12 +53,17 @@ BreakoutBasicNetwork = BreakeoutBasicNetwork
 
 def make_breakout_env(
     render_mode=None, *, mode=0, difficulty=0, frame_skip=4,
-    sticky_action_probability=0.25,
+    sticky_action_probability=0.25, reward_shaping="none", bounce_bonus=1.0,
+    rally_bonus_step=0.2, rally_bonus_max_multiplier=2.0,
 ):
     """
     Creates an ALE/Breakout-v5 environment with standard Atari preprocessing
     and 4-frame stacking so observations match (4, 84, 84).
     """
+    if reward_shaping not in ("none", "rally"):
+        raise ValueError(f"Unknown reward shaping: {reward_shaping!r}")
+    if reward_shaping == "rally" and mode not in (0, 4, 12, 32, 36, 44):
+        raise ValueError("Rally rewards support the selected modes 0, 4, 12, 32, 36, 44")
     gym.register_envs(ale_py)
     env = gym.make(
         "ALE/Breakout-v5",
@@ -68,6 +73,14 @@ def make_breakout_env(
         frameskip=1,
         repeat_action_probability=sticky_action_probability,
     )
+    if reward_shaping == "rally":
+        # Observe native RGB frames before AtariPreprocessing repeats actions.
+        # The wrapper preserves game rewards; training adds its separate bonus.
+        from experiments.ConceptCheck.rewards import RallyRewardTracker
+        env = RallyRewardTracker(
+            env, bounce_bonus=bounce_bonus, rally_bonus_step=rally_bonus_step,
+            rally_bonus_max_multiplier=rally_bonus_max_multiplier,
+        )
     env = gym.wrappers.AtariPreprocessing(
         env,
         frame_skip=frame_skip,

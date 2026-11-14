@@ -67,6 +67,12 @@ class ChildFactory:
                 "buffer_capacity": int(option(command, "--buffer-capacity")),
                 "epsilon_decay_steps": int(option(command, "--epsilon-decay-steps")),
                 "lr": float(option(command, "--lr")),
+                "gamma": float(option(command, "--gamma")),
+                "train_freq": int(option(command, "--train-freq")),
+                "reward_shaping": option(command, "--reward-shaping"),
+                "bounce_bonus": float(option(command, "--bounce-bonus")),
+                "rally_bonus_step": float(option(command, "--rally-bonus-step")),
+                "rally_bonus_max_multiplier": float(option(command, "--rally-bonus-max-multiplier")),
             }
         activation = option(command, "--activation")
         deterministic = "--deterministic" in command
@@ -487,8 +493,10 @@ class ExperimentTests(unittest.TestCase):
 
     def test_training_variants_are_forwarded_and_immutable(self):
         settings = ["--replay-storage", "frames", "--terminal-on-life-loss",
-                    "--buffer-capacity", "200000", "--epsilon-decay-steps", "1000000",
-                    "--lr", "0.00005"]
+                    "--buffer-capacity", "500000", "--epsilon-decay-steps", "1000000",
+                    "--lr", "0.00005", "--gamma", "0.995", "--train-freq", "2",
+                    "--reward-shaping", "rally", "--bounce-bonus", "1.5",
+                    "--rally-bonus-step", "0.3", "--rally-bonus-max-multiplier", "2.5"]
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             factory = ChildFactory()
@@ -496,16 +504,32 @@ class ExperimentTests(unittest.TestCase):
             first = factory.commands[0]
             self.assertEqual(option(first, "--replay-storage"), "frames")
             self.assertIn("--terminal-on-life-loss", first)
-            self.assertEqual(option(first, "--buffer-capacity"), "200000")
+            self.assertEqual(option(first, "--buffer-capacity"), "500000")
             self.assertEqual(option(first, "--epsilon-decay-steps"), "1000000")
             self.assertEqual(float(option(first, "--lr")), 5e-5)
+            self.assertEqual(float(option(first, "--gamma")), 0.995)
+            self.assertEqual(option(first, "--train-freq"), "2")
+            self.assertEqual(option(first, "--reward-shaping"), "rally")
+            for name, expected in (("bounce_bonus", 1.5), ("rally_bonus_step", 0.3),
+                                   ("rally_bonus_max_multiplier", 2.5)):
+                self.assertEqual(float(option(first, "--" + name.replace("_", "-"))), expected)
             resume = ["--run-dir", str(directory), "--resume-experiment"]
             parsed = experiment.parse_args(resume)
-            self.assertEqual(parsed.buffer_capacity, 200_000)
+            self.assertEqual(parsed.buffer_capacity, 500_000)
             self.assertTrue(parsed.terminal_on_life_loss)
+            for document in (json.loads((directory / "experiment.config.json").read_text()),
+                             json.loads((directory / "experiment.progress.json").read_text())["training_settings"],
+                             json.loads((directory / "model.step-000000012.config.json").read_text())):
+                for name in experiment.TRAINING_DEFAULTS:
+                    self.assertEqual(document[name], getattr(parsed, name))
+            factory = ChildFactory()
+            self.run_with(factory, resume)
+            self.assertEqual(factory.commands, [])
             for override in (["--replay-storage", "deque"], ["--no-terminal-on-life-loss"],
                              ["--buffer-capacity", "50000"], ["--epsilon-decay-steps", "250000"],
-                             ["--lr", "0.0001"]):
+                             ["--lr", "0.0001"], ["--gamma", "0.99"], ["--train-freq", "4"],
+                             ["--reward-shaping", "none"], ["--bounce-bonus", "1"],
+                             ["--rally-bonus-step", "0.2"], ["--rally-bonus-max-multiplier", "2"]):
                 with self.subTest(override=override), self.assertRaises(SystemExit):
                     experiment.parse_args([*resume, *override])
 
@@ -516,13 +540,44 @@ class ExperimentTests(unittest.TestCase):
             checkpoint = directory / "model.training.pt"
             saved = json.loads(checkpoint.read_text())
             for name, value in (("replay_storage", "frames"), ("terminal_on_life_loss", True),
-                                ("buffer_capacity", 200000), ("epsilon_decay_steps", 1000000), ("lr", 5e-5)):
+                                ("buffer_capacity", 200000), ("epsilon_decay_steps", 1000000), ("lr", 5e-5),
+                                ("gamma", 0.995), ("train_freq", 2), ("reward_shaping", "rally"),
+                                ("bounce_bonus", 2), ("rally_bonus_step", 0.3),
+                                ("rally_bonus_max_multiplier", 3)):
                 with self.subTest(name=name):
                     checkpoint.write_text(json.dumps({**saved, name: value}))
                     factory = ChildFactory()
                     with self.assertRaisesRegex(ValueError, "training settings"):
                         self.run_with(factory, ["--run-dir", str(directory), "--resume-experiment"])
                     self.assertEqual(factory.commands, [])
+
+    def test_invalid_revision_settings_are_rejected_before_creating_a_run(self):
+        invalid = [("--gamma", "nan"), ("--gamma", "1.1"), ("--gamma", "-0.1"),
+                   ("--train-freq", "0"), ("--train-freq", "-1"),
+                   ("--reward-shaping", "per"),
+                   ("--bounce-bonus", "nan"), ("--bounce-bonus", "-1"),
+                   ("--rally-bonus-step", "inf"), ("--rally-bonus-step", "-0.1"),
+                   ("--rally-bonus-max-multiplier", "nan"),
+                   ("--rally-bonus-max-multiplier", "0.9")]
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "not-created"
+            for option_name, value in invalid:
+                with self.subTest(option=option_name, value=value), self.assertRaises(SystemExit):
+                    experiment.parse_args(["--run-dir", str(run), option_name, value])
+            self.assertFalse(run.exists())
+
+    def test_changed_reward_recipe_in_weights_invalidates_cached_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self.run_with(ChildFactory(), self.arguments(directory))
+            weights = directory / "model.step-000000008.pth"
+            training_path = weights.with_suffix(".config.json")
+            training = json.loads(training_path.read_text())
+            training["reward_shaping"] = "rally"
+            training_path.write_text(json.dumps(training))
+            args = experiment.parse_args(["--run-dir", str(directory), "--resume-experiment"])
+            self.assertIsNone(experiment._evaluation_report(
+                directory / "eval-000000008.json", weights, 8, args, cached=True))
 
     def test_missing_new_fields_resume_with_legacy_training_defaults(self):
         with tempfile.TemporaryDirectory() as directory:

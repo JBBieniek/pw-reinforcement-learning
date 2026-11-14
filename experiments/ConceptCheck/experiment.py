@@ -29,6 +29,9 @@ SUMMARY_FIELDS = (
 TRAINING_DEFAULTS = {
     "replay_storage": "deque", "terminal_on_life_loss": False,
     "buffer_capacity": 50_000, "epsilon_decay_steps": 250_000, "lr": 1e-4,
+    "gamma": 0.99, "train_freq": 4, "reward_shaping": "none",
+    "bounce_bonus": 1.0, "rally_bonus_step": 0.2,
+    "rally_bonus_max_multiplier": 2.0,
 }
 
 
@@ -86,6 +89,12 @@ def parse_args(argv=None):
     parser.add_argument("--buffer-capacity", type=int, default=50_000)
     parser.add_argument("--epsilon-decay-steps", type=int, default=250_000)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--train-freq", type=int, default=4)
+    parser.add_argument("--reward-shaping", choices=["none", "rally"], default="none")
+    parser.add_argument("--bounce-bonus", type=float, default=1.0)
+    parser.add_argument("--rally-bonus-step", type=float, default=0.2)
+    parser.add_argument("--rally-bonus-max-multiplier", type=float, default=2.0)
     parser.add_argument("--milestones", type=_milestones, default=_milestones(DEFAULT_MILESTONES))
     parser.add_argument("--append-milestones", type=_milestones,
                         help="Append later evaluation budgets to a completed experiment")
@@ -157,6 +166,18 @@ def parse_args(argv=None):
         parser.error("--buffer-capacity must be at least 20000 and --epsilon-decay-steps positive")
     if not math.isfinite(args.lr) or args.lr <= 0:
         parser.error("--lr must be finite and positive")
+    if not math.isfinite(args.gamma) or not 0 <= args.gamma <= 1:
+        parser.error("--gamma must be finite and between 0 and 1")
+    if args.train_freq <= 0:
+        parser.error("--train-freq must be positive")
+    if not math.isfinite(args.bounce_bonus) or args.bounce_bonus < 0:
+        parser.error("--bounce-bonus must be finite and non-negative")
+    if not math.isfinite(args.rally_bonus_step) or args.rally_bonus_step < 0:
+        parser.error("--rally-bonus-step must be finite and non-negative")
+    if not math.isfinite(args.rally_bonus_max_multiplier) or args.rally_bonus_max_multiplier < 1:
+        parser.error("--rally-bonus-max-multiplier must be finite and at least 1")
+    if not math.isfinite(args.bounce_bonus * args.rally_bonus_max_multiplier):
+        parser.error("maximum rally bonus must be finite")
     if not math.isfinite(args.max_steps_per_second) or args.max_steps_per_second < 0:
         parser.error("--max-steps-per-second must be finite and non-negative")
     return args
