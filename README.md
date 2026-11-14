@@ -31,6 +31,7 @@ python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pil
 python -m experiments.ConceptCheck.pilot --run-dir outputs/ddqn-improvements-pilot --resume
 $milestones = (1..50 | ForEach-Object { $_ * 1000000 }) -join ','
 python -m experiments.ConceptCheck.experiment --run-dir outputs/ddqn-combined-50m --milestones $milestones --replay-storage frames --terminal-on-life-loss --buffer-capacity 200000 --epsilon-decay-steps 1000000 --max-steps-per-second 0
+python -m experiments.ConceptCheck.metrics --run-dir outputs/ddqn-combined-50m --output-prefix reports/ddqn-combined-50m-metrics
 python -m unittest discover -s tests -v
 ```
 
@@ -60,3 +61,5 @@ oraz oszczędnego bufora klatek (`--replay-storage frames`). Wyniki trafiają do
 `comparison.csv`; to wstępna selekcja ustawień, a nie dowód przewagi z jednego treningu.
 Wariant `ddqn-combined-50m` łączy trzy zmiany w jednym Double DQN. Każdy milion
 decyzji kończy się oceną 100 gier; wynik poprzedniego treningu jest w `reports/`.
+`metrics` zbiera ukończone oceny co milion i zapisuje CSV oraz wykres PNG/SVG.
+Pokazuje średnią, medianę, maksimum i przedział 25–75% wyników gier.
