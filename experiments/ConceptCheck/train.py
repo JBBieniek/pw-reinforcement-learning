@@ -1,483 +1,225 @@
+"""Image DQN/DDQN with uniform replay; checkpoints keep weights and Adam, not replay/game."""
+import argparse
+import csv
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
 import os
+from pathlib import Path
 import random
 import secrets
-import sys
-from pathlib import Path
-from shutil import copyfile
-from collections import deque
-import argparse
+import shutil
+import time
 import numpy as np
 import torch
-import torch.nn as nn
-from tqdm import tqdm
-
+from torch import nn
 if __package__:
-    from .dqn import compute_td_targets
-    from .neural_network import BreakoutBasicNetwork, configure_activation, make_breakout_env
-    from .runtime import configure_determinism
-    from .health import HealthMonitor, RepresentationCollapseError
-    from .run_logging import TrainingRun
-    from .pacing import StepPacer
-    from .replay import FrameReplayBuffer
-    from .checkpoints import (load_training_checkpoint, restore_training_checkpoint,
-                              save_training_checkpoint, training_checkpoint_path)
+    from .model import Network, configure
+    from .rewards import make_env
 else:
-    # Keep pickled replay classes importable from module and script entry points.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from dqn import compute_td_targets
-    from neural_network import BreakoutBasicNetwork, configure_activation, make_breakout_env
-    from runtime import configure_determinism
-    from health import HealthMonitor, RepresentationCollapseError
-    from run_logging import TrainingRun
-    from pacing import StepPacer
-    from experiments.ConceptCheck.replay import FrameReplayBuffer
-    from checkpoints import (load_training_checkpoint, restore_training_checkpoint,
-                             save_training_checkpoint, training_checkpoint_path)
+    from model import Network, configure
+    from rewards import make_env
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Train DQN or Double DQN on Breakout", allow_abbrev=False)
-    parser.add_argument("--algorithm", choices=["dqn", "double-dqn"], default="dqn", help="TD target calculation")
-    parser.add_argument("--activation", choices=["relu", "leaky-relu"], default="leaky-relu", help="CNN activation (saved with weights)")
-    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True, help="Use reproducible GPU operations on this software/hardware stack")
-    parser.add_argument("--health-freq", type=int, default=1_000, help="Steps between CNN health checks (0: disabled)")
-    parser.add_argument("--health-patience", type=int, default=3, help="Consecutive dead-feature checks before stopping")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (default: generate and save one for this run)")
-    parser.add_argument("--device", type=str, default=None, help="PyTorch device, e.g. cpu or cuda (default: auto)")
-    parser.add_argument("--torch-threads", type=int, default=2, help="PyTorch CPU worker threads")
-    parser.add_argument("--max-steps-per-second", type=float, default=0.0, help="Soft decision-rate limit to leave compute headroom (0: unlimited)")
-    parser.add_argument("--mode", type=int, default=0, help="Breakout game mode")
-    parser.add_argument("--difficulty", type=int, choices=[0, 1], default=0, help="Breakout difficulty")
-    parser.add_argument("--frame-skip", type=int, choices=[2, 4, 8], default=4, help="Emulator frames per agent action")
-    parser.add_argument("--sticky-action-probability", type=float, choices=[0.0, 0.25], default=0.25, help="Probability of repeating the previous action")
-    parser.add_argument("--steps", type=int, default=1_000_000, help="Total training environment steps")
-    parser.add_argument("--stop-at", type=int, default=None, help="Pause at this absolute step while keeping --steps as the overall target")
-    parser.add_argument("--resume", type=str, default=None, help="Trusted local .training.pt snapshot to continue")
-    parser.add_argument("--checkpoint-freq", type=int, default=1_000_000, help="Steps between full resumable snapshots and milestone weights")
-    parser.add_argument("--checkpoint-path", type=str, default=None, help="Full snapshot path (default: <save-path>.training.pt)")
-    parser.add_argument("--train-freq", type=int, default=4, help="Environment steps between gradient updates")
-    parser.add_argument("--log-freq", type=int, default=1_000, help="Environment steps between progress and metrics writes")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for gradient descent")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--reward-shaping", choices=["none", "rally"], default="none",
-                        help="Optional bounded paddle/rally bonus; game scores remain raw")
-    parser.add_argument("--bounce-bonus", type=float, default=1.0, help="Bonus per detected paddle bounce")
-    parser.add_argument("--rally-bonus-step", type=float, default=0.2, help="Multiplier increment per raw rally point")
-    parser.add_argument("--rally-bonus-max-multiplier", type=float, default=2.0,
-                        help="Cap on the entire rally bonus, as a multiple of --bounce-bonus")
-    parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial exploration rate")
-    parser.add_argument("--epsilon-end", type=float, default=0.1, help="Final exploration rate")
-    parser.add_argument("--epsilon-decay-steps", type=int, default=250_000, help="Steps over which epsilon decays")
-    parser.add_argument("--buffer-capacity", type=int, default=50_000, help="Replay buffer max capacity")
-    parser.add_argument("--replay-storage", choices=["deque", "frames"], default="deque", help="Uniform replay storage; frames shares overlapping observation frames")
-    parser.add_argument("--terminal-on-life-loss", action=argparse.BooleanOptionalAction, default=False, help="Mask the training TD bootstrap after a lost life, without resetting the full game")
-    parser.add_argument("--min-replay-size", type=int, default=20_000, help="Minimum transitions before training")
-    parser.add_argument("--target-update-freq", type=int, default=10_000, help="Frequency of target net update (steps)")
-    parser.add_argument("--save-freq", type=int, default=25_000, help="Checkpoint save frequency (steps)")
-    parser.add_argument(
-        "--save-path",
-        type=str,
-        default=None,
-        help="Weights path (default: breakout_<algorithm>.pth next to this script)",
-    )
-    parser.add_argument("--render", action="store_true", help="Render environment window during training (slows down training)")
-    arguments = sys.argv[1:] if argv is None else list(argv)
-    args = parser.parse_args(arguments)
-    supplied = {argument.split("=", 1)[0] for argument in arguments if argument.startswith("--")}
-    resume_state = None
-    if args.resume:
-        try:
-            resume_state = load_training_checkpoint(args.resume)
-        except (OSError, ValueError, RuntimeError) as exc:
-            parser.error(str(exc))
-        saved = resume_state["config"]
-        fixed = (
-            "algorithm", "seed", "mode", "difficulty", "frame_skip",
-            "sticky_action_probability", "train_freq", "batch_size", "lr", "gamma",
-            "epsilon_start", "epsilon_end", "epsilon_decay_steps", "buffer_capacity",
-            "min_replay_size", "target_update_freq", "activation", "deterministic",
-            "replay_storage", "terminal_on_life_loss",
-            "reward_shaping", "bounce_bonus", "rally_bonus_step", "rally_bonus_max_multiplier",
-        )
-        legacy_defaults = {"activation": "relu", "deterministic": False,
-                           "replay_storage": "deque", "terminal_on_life_loss": False,
-                           "reward_shaping": "none", "bounce_bonus": 1.0,
-                           "rally_bonus_step": 0.2, "rally_bonus_max_multiplier": 2.0}
-        for name in fixed:
-            option = "--" + name.replace("_", "-")
-            value = saved[name] if name in saved else legacy_defaults[name]
-            explicit = option in supplied or (name in ("deterministic", "terminal_on_life_loss")
-                                              and "--no-" + name.replace("_", "-") in supplied)
-            if explicit and getattr(args, name) != value:
-                parser.error(f"{option} differs from the training checkpoint ({value!r})")
-            setattr(args, name, value)
-        for name in ("steps", "save_path", "save_freq", "log_freq", "checkpoint_freq", "checkpoint_path", "max_steps_per_second", "health_freq", "health_patience"):
-            if "--" + name.replace("_", "-") not in supplied and name in saved:
-                setattr(args, name, saved[name])
-        if "--save-path" in supplied and "--checkpoint-path" not in supplied:
-            args.checkpoint_path = None
-    if args.seed is None:
-        args.seed = secrets.randbits(32)
-    if not 0 <= args.seed < 2**32:
-        parser.error("--seed must be between 0 and 4294967295")
-    for name in ("steps", "batch_size", "epsilon_decay_steps", "buffer_capacity", "min_replay_size", "target_update_freq", "save_freq", "train_freq", "log_freq", "torch_threads", "checkpoint_freq", "health_patience"):
-        if getattr(args, name) <= 0:
-            parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.health_freq < 0:
-        parser.error("--health-freq must be non-negative")
-    if not args.batch_size <= args.min_replay_size <= args.buffer_capacity:
-        parser.error("require --batch-size <= --min-replay-size <= --buffer-capacity")
-    if not 0.0 <= args.gamma <= 1.0:
-        parser.error("--gamma must be between 0 and 1")
-    if not 0.0 <= args.epsilon_end <= args.epsilon_start <= 1.0:
-        parser.error("require 0 <= --epsilon-end <= --epsilon-start <= 1")
-    if not args.lr > 0.0 or not np.isfinite(args.lr):
-        parser.error("--lr must be finite and positive")
-    for name, minimum in (("bounce_bonus", 0.0), ("rally_bonus_step", 0.0),
-                          ("rally_bonus_max_multiplier", 1.0)):
-        if not np.isfinite(getattr(args, name)) or getattr(args, name) < minimum:
-            parser.error(f"--{name.replace('_', '-')} must be finite and at least {minimum}")
-    if not np.isfinite(args.bounce_bonus * args.rally_bonus_max_multiplier):
-        parser.error("maximum rally bonus must be finite")
-    if not np.isfinite(args.max_steps_per_second) or args.max_steps_per_second < 0:
-        parser.error("--max-steps-per-second must be finite and non-negative")
-    if args.save_path is None:
-        filename = f"breakout_{args.algorithm.replace('-', '_')}.pth"
-        args.save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
-    args.save_path = os.path.abspath(args.save_path)
-    args.checkpoint_path = os.path.abspath(args.checkpoint_path or training_checkpoint_path(args.save_path))
-    if args.checkpoint_path == args.save_path:
-        parser.error("--checkpoint-path and --save-path must be different files")
-    start_step = resume_state["step"] if resume_state else 0
-    if args.steps <= start_step:
-        parser.error("--steps must exceed the checkpoint's completed step")
-    if args.stop_at is not None and not start_step < args.stop_at <= args.steps:
-        parser.error("--stop-at must exceed the saved step and cannot exceed --steps")
-    args._resume_state = resume_state
-    return args
+@torch.no_grad()
+def compute_targets(policy, target, next_states, rewards, terminal, gamma, algorithm="double-dqn"):
+    next_q = target(next_states)
+    if algorithm == "double-dqn":
+        next_q = next_q.gather(1, policy(next_states).argmax(1, keepdim=True))
+    else:
+        next_q = next_q.max(1, keepdim=True).values
+    return rewards + gamma * (~terminal).float() * next_q
 
 
-def train(argv=None):
-    args = parse_args(argv)
-    resume_state = vars(args).pop("_resume_state")
+def digest(value):
+    h = hashlib.sha256()
+    def add(x):
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        if isinstance(x, np.ndarray):
+            h.update(str((x.dtype, x.shape)).encode()); h.update(x.tobytes())
+        elif isinstance(x, dict):
+            for key in sorted(x, key=str):
+                add(key); add(x[key])
+        elif isinstance(x, (tuple, list)):
+            for item in x: add(item)
+        else:
+            h.update(repr(x).encode())
+    add(value)
+    return h.hexdigest()
 
-    configure_determinism(args.deterministic)
-    torch.set_num_threads(args.torch_threads)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    algorithm_name = "Double DQN" if args.algorithm == "double-dqn" else "DQN"
-    print(f"Algorithm: {algorithm_name} | Device: {device} | Seed: {args.seed} | Activation: {args.activation} | Deterministic: {args.deterministic}")
-    os.makedirs(os.path.dirname(os.path.abspath(args.save_path)), exist_ok=True)
 
-    render_mode = "human" if args.render else None
-    reward_options = ({name: getattr(args, name) for name in (
-        "reward_shaping", "bounce_bonus", "rally_bonus_step", "rally_bonus_max_multiplier",
-    )} if args.reward_shaping == "rally" else {})
-    env = make_breakout_env(
-        render_mode=render_mode,
-        mode=args.mode,
-        difficulty=args.difficulty,
-        frame_skip=args.frame_skip,
-        sticky_action_probability=args.sticky_action_probability,
-        **reward_options,
-    )
-    env.action_space.seed(args.seed)
+def write_json(path, value):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
-    n_actions = env.action_space.n
-    policy_net = configure_activation(BreakoutBasicNetwork(in_channels=4, n_actions=n_actions), args.activation).to(device)
-    target_net = configure_activation(BreakoutBasicNetwork(in_channels=4, n_actions=n_actions), args.activation).to(device)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-    target_net.requires_grad_(False)
 
-    optimizer = torch.optim.Adam(policy_net.parameters(), lr=args.lr)
-    loss_fn = nn.SmoothL1Loss()
+def restore_rng(state, device):
+    random.setstate(state["python"]); np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if device.type == "cuda": torch.cuda.set_rng_state_all(state["cuda"])
 
-    replay_buffer = (FrameReplayBuffer(args.buffer_capacity) if args.replay_storage == "frames"
-                     else deque(maxlen=args.buffer_capacity))
 
-    state, reset_info = env.reset(seed=args.seed)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start", type=Path, help="Trusted weights/Adam checkpoint; starts a new game and replay")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--decisions", type=int, default=500_000)
+    parser.add_argument("--reward", choices=["raw", "small-bounce", "landing"], default="raw")
+    parser.add_argument("--algorithm", choices=["dqn", "double-dqn"], default=None)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--eval-every", type=int, default=1_000_000, help="Decision interval; 0 disables evaluation")
+    parser.add_argument("--eval-episodes", type=int, default=100)
+    parser.add_argument("--eval-seed", type=int, default=1847319063)
+    for name, kind in (("lr", float), ("gamma", float), ("buffer-capacity", int),
+                       ("train-freq", int), ("batch-size", int), ("min-replay-size", int),
+                       ("target-update-freq", int), ("mode", int), ("difficulty", int),
+                       ("frame-skip", int), ("sticky-action-probability", float)):
+        parser.add_argument("--" + name, type=kind, default=None)
+    args = parser.parse_args(argv)
+    start = torch.load(args.start, map_location="cpu", weights_only=False) if args.start else {}
+    previous, cfg = start.get("config", {}), {}
+    defaults = dict(lr=5e-5, gamma=0.995, buffer_capacity=500_000, train_freq=2, batch_size=32,
+                    min_replay_size=20_000, target_update_freq=10_000, algorithm="double-dqn",
+                    mode=0, difficulty=0, frame_skip=4, sticky_action_probability=0.25,
+                    epsilon_start=1.0, epsilon_end=0.1, epsilon_decay_steps=1_000_000)
+    for name, default in defaults.items():
+        value = getattr(args, name, None)
+        cfg[name] = value if value is not None else previous.get(name, default)
+    cfg.update(reward=args.reward, seed=args.seed if args.seed is not None else previous.get("seed", secrets.randbits(32)))
+    if (args.decisions <= 0 or args.eval_every < 0 or args.eval_episodes <= 0 or not 0 <= args.eval_seed < 2**32
+            or not 1 <= cfg["batch_size"] <= cfg["min_replay_size"] <= cfg["buffer_capacity"]
+            or cfg["train_freq"] <= 0 or not math.isfinite(cfg["lr"]) or cfg["lr"] <= 0
+            or cfg["target_update_freq"] <= 0 or cfg["frame_skip"] <= 0
+            or not 0 <= cfg["sticky_action_probability"] <= 1
+            or not 0 <= cfg["gamma"] <= 1 or not 0 <= cfg["seed"] < 2**32):
+        parser.error("Invalid decision budget, replay, learning rate, gamma or seed")
+    args.output.mkdir(parents=True, exist_ok=True)
+    if (args.output / "model.progress.json").exists():
+        parser.error("Output directory already contains a run")
+    device = torch.device(args.device)
+    configure(device)
+    random.seed(cfg["seed"]); np.random.seed(cfg["seed"]); torch.manual_seed(cfg["seed"])
+    env = make_env(args.reward, cfg["mode"], cfg["difficulty"], cfg["frame_skip"],
+                   cfg["sticky_action_probability"], cfg["gamma"])
+    state, _ = env.reset(seed=cfg["seed"])
     state = np.array(state)
-    previous_lives = reset_info.get("lives")
-
-    epsilon = args.epsilon_start
-    recent_loss = 0.0
-    episode_reward = 0.0
-    last_episode_reward = 0.0
-    episodes_completed = 0
-    reward_state = {
-        "episode_bonus": 0.0, "last_episode_bonus": 0.0,
-        "episode_bounces": 0, "last_episode_bounces": 0,
-        "total_bonus": 0.0, "total_bounces": 0,
-        "tracker_bonus_total": 0.0, "tracker_bounces_total": 0,
-    }
-
-    def set_reward_baseline(info):
-        if args.reward_shaping == "rally":
-            totals = info.get("rally_reward")
-            if not isinstance(totals, dict):
-                raise ValueError("Rally reward tracking information is missing")
-            reward_state["tracker_bonus_total"] = float(totals["bonus_total"])
-            reward_state["tracker_bounces_total"] = int(totals["bounces_total"])
-
+    env.action_space.seed(cfg["seed"])
+    policy, target = Network().to(device), Network().to(device)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=cfg["lr"])
+    if start:
+        policy.load_state_dict(start["policy_net"])
+        target.load_state_dict(start["target_net"])
+        optimizer.load_state_dict(start["optimizer"])
+        restore_rng(start["rng"], device)
+    else:
+        target.load_state_dict(policy.state_dict())
+    for group in optimizer.param_groups: group["lr"] = cfg["lr"]
+    target.eval().requires_grad_(False)
+    source_step = int(start.get("step", start.get("source_step", 0)))
+    def rng():
+        return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                    cuda=torch.cuda.get_rng_state_all() if device.type == "cuda" else [])
+    write_json(args.output / "initial_state_hashes.json", dict(
+        policy=digest(policy.state_dict()), target=digest(target.state_dict()),
+        optimizer=digest(optimizer.state_dict()), rng=digest(rng()), observation=digest(state)))
+    replay, position, updates, trace = [], 0, 0, hashlib.sha256()
+    step, episode_score, last_score, aux_total, episode_aux, last_aux = 0, 0., 0., 0., 0., 0.
+    loss_value, grad_norm, q_std, feature_std = 0., 0., 0., None
+    began, status, error, collapsed_checks = time.perf_counter(), "running", None, 0
+    def progress():
+        elapsed = time.perf_counter() - began
+        write_json(args.output / "model.progress.json", dict(status=status, pid=os.getpid(),
+            decisions=step, absolute_step=source_step+step, total_steps=args.decisions,
+            training_steps_per_second=step/elapsed if elapsed else None, elapsed_seconds=elapsed,
+            epsilon=epsilon, loss=loss_value, gradient_norm=grad_norm, q_std=q_std,
+            feature_std=feature_std, replay_size=len(replay), gradient_updates=updates,
+            last_episode_reward=last_score, last_episode_aux=last_aux, total_aux=aux_total,
+            warmup_trace_sha256=trace.hexdigest() if step >= cfg["min_replay_size"] else None,
+            error=error, updated_at_utc=datetime.now(timezone.utc).isoformat()))
+    def save():
+        temporary = args.output / "model.tmp"
+        torch.save(dict(policy_net=policy.state_dict(), target_net=target.state_dict(),
+            optimizer=optimizer.state_dict(), config=cfg, rng=rng(), epsilon=epsilon,
+            step=source_step+step, source_step=source_step, trained_decisions=step,
+            warmup_trace_sha256=trace.hexdigest()), temporary)
+        temporary.replace(args.output / "model.pt")
+    epsilon = float(start.get("epsilon", cfg["epsilon_start"]))
+    progress()
     try:
-        set_reward_baseline(reset_info)
-    except Exception:
-        env.close()
-        raise
-
-    step = 0
-    elapsed_seconds = 0.0
-    health = HealthMonitor(Path(args.save_path).with_suffix(".health.json"), patience=args.health_patience)
-    if resume_state:
-        restored = restore_training_checkpoint(
-            resume_state, policy_net=policy_net, target_net=target_net,
-            optimizer=optimizer, env=env, device=device,
-        )
-        replay_buffer = restored["replay_buffer"]
-        state = restored["state"]
-        step = restored["step"]
-        epsilon = restored["epsilon"]
-        episode_reward = restored["episode_reward"]
-        last_episode_reward = restored["last_episode_reward"]
-        episodes_completed = restored["episodes_completed"]
-        recent_loss = restored["recent_loss"]
-        elapsed_seconds = restored.get("elapsed_seconds", 0.0)
-        previous_lives = restored.get("previous_lives")
-        reward_state.update(restored.get("reward_state", {}))
-        if not restored["environment_restored"]:
-            reward_state["episode_bonus"] = 0.0
-            reward_state["episode_bounces"] = 0
-            set_reward_baseline(restored.get("reset_info", {}))
-        health.set_state(restored.get("health_state", {}))
-        print(f"Resumed step {step}; replay={len(replay_buffer)}; "
-              f"game restored={restored['environment_restored']}; "
-              f"exact trajectory={restored['environment_restore_exact']}")
-        del restored, resume_state
-    if args.terminal_on_life_loss and previous_lives is None:
-        env.close()
-        raise ValueError("--terminal-on-life-loss requires the environment's lives counter")
-    run = TrainingRun(args, device, start_step=step, elapsed_seconds=elapsed_seconds)
-    end_step = min(args.steps, args.stop_at) if args.stop_at is not None else args.steps
-    status = "paused" if end_step < args.steps else "completed"
-    error = None
-    step_in_progress = False
-    last_full_step = None
-    last_training_states = None
-    pbar = tqdm(range(step + 1, end_step + 1), desc=f"Training {algorithm_name}", unit="step", disable=not os.isatty(2))
-    pacer = StepPacer(args.max_steps_per_second)
-
-    def reward_metrics():
-        if args.reward_shaping != "rally":
-            return None
-        return {
-            "episode_raw_reward": episode_reward,
-            "episode_bonus": reward_state["episode_bonus"],
-            "episode_training_reward": episode_reward + reward_state["episode_bonus"],
-            "last_episode_bonus": reward_state["last_episode_bonus"],
-            "last_episode_training_reward": last_episode_reward + reward_state["last_episode_bonus"],
-            "episode_bounces": reward_state["episode_bounces"],
-            "last_episode_bounces": reward_state["last_episode_bounces"],
-            "total_bonus": reward_state["total_bonus"],
-            "total_bounces": reward_state["total_bounces"],
-        }
-
-    run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed,
-               last_episode_reward, reward_metrics=reward_metrics())
-
-    def save_weights(path):
-        path = Path(path)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        try:
-            torch.save(policy_net.state_dict(), temporary)
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    def save_full_state():
-        nonlocal last_full_step
-        save_training_checkpoint(
-            args.checkpoint_path, args=args, policy_net=policy_net,
-            target_net=target_net, optimizer=optimizer, replay_buffer=replay_buffer,
-            state=state, step=step, epsilon=epsilon, episode_reward=episode_reward,
-            last_episode_reward=last_episode_reward, episodes_completed=episodes_completed,
-            recent_loss=recent_loss, env=env, elapsed_seconds=run.elapsed_seconds(),
-            health_state=health.get_state(),
-            previous_lives=previous_lives,
-            reward_state=reward_state,
-        )
-        milestone = Path(args.save_path).with_name(f"{Path(args.save_path).stem}.step-{step:09d}.pth")
-        save_weights(milestone)
-        copyfile(Path(args.save_path).with_suffix(".config.json"), milestone.with_suffix(".config.json"))
-        last_full_step = step
-
-    try:
-        for next_step in pbar:
-            step_in_progress = True
-            # Epsilon-greedy action selection
+        for step in range(1, args.decisions+1):
             if random.random() < epsilon:
                 action = env.action_space.sample()
             else:
-                with torch.no_grad():
-                    state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
-                    q_values = policy_net(state_tensor)
-                    action = q_values.argmax(dim=1).item()
-
+                with torch.no_grad(): action = int(policy(torch.from_numpy(state).unsqueeze(0).to(device)).argmax(1))
             next_state, reward, terminated, truncated, info = env.step(action)
             next_state = np.array(next_state)
-            done = terminated or truncated
-            lives = info.get("lives")
-            if args.terminal_on_life_loss and lives is None:
-                raise ValueError("The environment stopped reporting its lives counter")
-            life_lost = bool(args.terminal_on_life_loss and lives < previous_lives)
-            learning_terminal = bool(terminated or life_lost)
-
-            episode_reward += reward
-            bonus = 0.0
-            if args.reward_shaping == "rally":
-                totals = info.get("rally_reward")
-                if not isinstance(totals, dict):
-                    raise ValueError("Rally reward tracking information is missing")
-                bonus = float(totals["bonus_total"]) - reward_state["tracker_bonus_total"]
-                bounces = int(totals["bounces_total"]) - reward_state["tracker_bounces_total"]
-                if not np.isfinite(bonus) or bonus < -1e-9 or bounces < 0:
-                    raise ValueError("Rally reward counters moved backwards or became non-finite")
-                bonus = max(0.0, bonus)
-                reward_state["episode_bonus"] += bonus
-                reward_state["total_bonus"] += bonus
-                reward_state["episode_bounces"] += bounces
-                reward_state["total_bounces"] += bounces
-                set_reward_baseline(info)
-            # Truncation resets the environment but must not mask bootstrapping.
-            # The opt-in life-loss variant changes only this TD mask. Scores,
-            # game resets and observation stacking still cover the full game.
-            replay_buffer.append((state, action, float(reward) + bonus, next_state, learning_terminal))
-
-            if done:
-                state, reset_info = env.reset()
-                state = np.array(state)
-                previous_lives = reset_info.get("lives")
-                set_reward_baseline(reset_info)
-                last_episode_reward = episode_reward
-                reward_state["last_episode_bonus"] = reward_state["episode_bonus"]
-                reward_state["last_episode_bounces"] = reward_state["episode_bounces"]
-                reward_state["episode_bonus"] = 0.0
-                reward_state["episode_bounces"] = 0
-                episode_reward = 0.0
-                episodes_completed += 1
-            else:
-                state = next_state
-                previous_lives = lives
-
-            # Epsilon linear decay
-            if next_step <= args.epsilon_decay_steps:
-                epsilon = args.epsilon_start - (args.epsilon_start - args.epsilon_end) * (next_step / args.epsilon_decay_steps)
-            else:
-                epsilon = args.epsilon_end
-
-            # Gradient descent step
-            if len(replay_buffer) >= args.min_replay_size and next_step % args.train_freq == 0:
-                batch = (replay_buffer.sample(args.batch_size)
-                         if isinstance(replay_buffer, FrameReplayBuffer)
-                         else random.sample(replay_buffer, args.batch_size))
-                b_states, b_actions, b_rewards, b_next_states, b_terminated = zip(*batch)
-
-                b_states = torch.from_numpy(np.array(b_states)).to(device)
-                b_actions = torch.tensor(b_actions, dtype=torch.long, device=device).unsqueeze(1)
-                b_rewards = torch.tensor(b_rewards, dtype=torch.float32, device=device).unsqueeze(1)
-                b_next_states = torch.from_numpy(np.array(b_next_states)).to(device)
-                b_terminated = torch.tensor(b_terminated, dtype=torch.bool, device=device).unsqueeze(1)
-
-                current_q = policy_net(b_states).gather(1, b_actions)
-
-                target_q = compute_td_targets(
-                    policy_net, target_net, b_next_states, b_rewards,
-                    b_terminated, args.gamma, args.algorithm,
-                )
-
-                loss = loss_fn(current_q, target_q)
-                if not torch.isfinite(loss):
-                    raise FloatingPointError(f"Non-finite loss at step {next_step}")
-
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10.0)
-                optimizer.step()
-
-                recent_loss = loss.item()
-                last_training_states = b_states
-
-            # Target network update
-            if next_step % args.target_update_freq == 0:
-                target_net.load_state_dict(policy_net.state_dict())
-
-            step = next_step
-            step_in_progress = False
-
-            if args.health_freq and step % args.health_freq == 0 and last_training_states is not None:
+            episode_score += info["raw_reward"]; episode_aux += info["aux_reward"]; aux_total += info["aux_reward"]
+            if step <= cfg["min_replay_size"]:
+                trace.update(state.tobytes()); trace.update(bytes([action])); trace.update(repr(info["raw_reward"]).encode())
+            transition = (state, action, reward, next_state, info["learning_terminal"])
+            if len(replay) < cfg["buffer_capacity"]: replay.append(transition)
+            else: replay[position] = transition
+            position = (position+1) % cfg["buffer_capacity"]
+            state = next_state
+            if terminated or truncated:
+                state, _ = env.reset(); state = np.array(state)
+                last_score, last_aux, episode_score, episode_aux = episode_score, episode_aux, 0., 0.
+            absolute = source_step+step
+            epsilon = max(cfg["epsilon_end"], cfg["epsilon_start"] -
+                          (cfg["epsilon_start"]-cfg["epsilon_end"])*absolute/cfg["epsilon_decay_steps"])
+            if len(replay) >= cfg["min_replay_size"] and absolute % cfg["train_freq"] == 0:
+                states, actions, rewards, next_states, terminal = zip(*random.sample(replay, cfg["batch_size"]))
+                states = torch.as_tensor(np.stack(states), device=device)
+                next_states = torch.as_tensor(np.stack(next_states), device=device)
+                actions = torch.tensor(actions, device=device).unsqueeze(1)
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(1)
+                terminal = torch.tensor(terminal, dtype=torch.bool, device=device).unsqueeze(1)
+                q = policy(states)
+                expected = compute_targets(policy, target, next_states, rewards, terminal, cfg["gamma"], cfg["algorithm"])
+                loss = nn.functional.smooth_l1_loss(q.gather(1, actions), expected)
+                optimizer.zero_grad(); loss.backward()
+                grad_norm = float(nn.utils.clip_grad_norm_(policy.parameters(), 10.))
+                if not torch.isfinite(loss) or not math.isfinite(grad_norm): raise FloatingPointError("Non-finite update")
+                optimizer.step(); updates += 1
+                loss_value, q_std = float(loss.detach()), float(q.detach().std())
+                if step % 1000 == 0:
+                    with torch.no_grad(): feature_std = float(policy.conv(states.float()/255.).std(dim=0).mean())
+                    collapsed_checks = collapsed_checks+1 if feature_std < 1e-10 else 0
+                    if collapsed_checks >= 3: raise RuntimeError("Image features collapsed")
+            if absolute % cfg["target_update_freq"] == 0: target.load_state_dict(policy.state_dict())
+            if step % 250_000 == 0: save()
+            if args.eval_every and step % args.eval_every == 0:
+                if __package__: from .evaluate import evaluate
+                else: from evaluate import evaluate
+                save(); status = "evaluating"; progress()
+                checkpoint = args.output / f"model-{absolute:09d}.pt"
+                shutil.copyfile(args.output / "model.pt", checkpoint)
+                training_rng = rng()
                 try:
-                    health.check(policy_net, last_training_states, step)
-                except RepresentationCollapseError:
-                    # This completed step is safe to retain for diagnosis.
-                    save_full_state()
-                    raise
-
-            # Periodic checkpoint save
-            if step % args.save_freq == 0:
-                save_weights(args.save_path)
-
-            if step % args.checkpoint_freq == 0:
-                save_full_state()
-
-            if step % args.log_freq == 0:
-                run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed,
-                           last_episode_reward, reward_metrics=reward_metrics())
-                print(f"step={step}/{args.steps} loss={recent_loss:.5f} epsilon={epsilon:.3f} episodes={episodes_completed} last_reward={last_episode_reward}", flush=True)
-
-            # Update progress bar metrics
-            if step % 20 == 0 or step == args.steps:
-                pbar.set_postfix({
-                    "loss": f"{recent_loss:.4f}",
-                    "eps": f"{epsilon:.3f}",
-                    "buf": len(replay_buffer),
-                    "last_ep_rew": last_episode_reward,
-                    "episodes": episodes_completed,
-                })
-            pacer.wait()
-
-    except KeyboardInterrupt:
-        status = "interrupted"
-        print("\nTraining interrupted by user. Saving current model state...")
-    except Exception as exc:
-        status = "failed"
-        error = repr(exc)
+                    report = evaluate(checkpoint, args.output / f"eval-{absolute:09d}.json",
+                                      args.eval_episodes, args.eval_seed, args.device)
+                finally:
+                    restore_rng(training_rng, device)
+                metrics = args.output / "comparison.csv"
+                row = dict(step=absolute, **report["summary"])
+                with metrics.open("a", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(row))
+                    if handle.tell() == 0: writer.writeheader()
+                    writer.writerow(row)
+                status = "running"; progress()
+            if step % 1000 == 0:
+                progress(); print(f"{args.reward} {step}/{args.decisions} loss={loss_value:.4f} raw={last_score}", flush=True)
+        status = "completed"
+    except BaseException as exc:
+        status, error = "failed", repr(exc)
         raise
     finally:
-        try:
-            save_weights(args.save_path)
-            if status != "failed" and not step_in_progress and last_full_step != step:
-                save_full_state()
-            elif step_in_progress:
-                print("Step was interrupted; resume from the previous full snapshot.")
-            print(f"Model saved to: {args.save_path}")
-        except Exception as exc:
-            status = "failed"
-            error = repr(exc)
-            raise
-        finally:
-            try:
-                env.close()
-            except Exception as exc:
-                status = "failed"
-                error = repr(exc)
-                raise
-            finally:
-                run.record(step, recent_loss, epsilon, len(replay_buffer), episodes_completed,
-                           last_episode_reward, status, error, reward_metrics=reward_metrics())
+        save(); progress(); env.close()
 
 
 if __name__ == "__main__":
-    train()
+    main()

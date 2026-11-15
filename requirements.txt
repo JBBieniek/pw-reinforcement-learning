@@ -1,9 +1,5 @@
-
 gymnasium[atari]
 ale-py
 pygame
 numpy
-matplotlib
 torch
-stable-baselines3[extra]
-tqdm
