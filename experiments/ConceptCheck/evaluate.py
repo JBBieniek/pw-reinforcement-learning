@@ -47,7 +47,7 @@ def evaluate(model_path, output, episodes=100, seed=1847319063, device="cuda", m
                 if terminated or truncated:
                     break
             records.append({"seed": game_seed, "reward": score, "steps": step,
-                            "capped": not (terminated or truncated)})
+                            "capped": bool(truncated or not terminated)})
     finally:
         env.close()
     scores = [record["reward"] for record in records]

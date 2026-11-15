@@ -4,6 +4,11 @@ import numpy as np
 import gymnasium as gym
 import torch
 from torch import nn
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+from experiments.ConceptCheck.evaluate import evaluate
+from experiments.ConceptCheck.model import Network
 from experiments.ConceptCheck.rewards import NativeSignals, RewardWrapper, extra_reward, landing_potential
 from experiments.ConceptCheck.train import compute_targets
 
@@ -29,6 +34,19 @@ class Native(gym.Env):
 
 
 class CoreTests(unittest.TestCase):
+    def test_evaluation_counts_environment_and_decision_limits(self):
+        env, observation = Native(), np.zeros((4, 84, 84), dtype=np.uint8)
+        env.reset = lambda **kwargs: (observation, {"lives": 5})
+        with TemporaryDirectory() as folder:
+            model, output = Path(folder) / "model.pt", Path(folder) / "eval.json"
+            torch.save({"policy_net": Network().state_dict()}, model)
+            for terminated, truncated, capped in ((False, True, 1), (True, False, 0), (False, False, 1)):
+                env.step = lambda action: (observation, 7., terminated, truncated, {"lives": 5})
+                with patch("experiments.ConceptCheck.evaluate.make_env", return_value=env):
+                    report = evaluate(model, output, episodes=1, device="cpu", max_steps=1)
+                self.assertEqual(report["summary"]["hit_step_limit"], capped)
+                self.assertEqual(report["summary"]["mean_reward"], 7.)
+
     def test_double_dqn_selection_and_terminal_mask(self):
         policy, target = nn.Linear(1, 2), nn.Linear(1, 2)
         with torch.no_grad():
