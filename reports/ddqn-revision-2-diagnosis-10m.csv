@@ -1,0 +1,4 @@
+checkpoint_step,games,mean_game_score,median_game_score,bounces_per_life,points_per_rally,zero_point_rallies,rallies,capped_games
+7000000,8,225.875,241.5,11.7,3.861111111111111,0,468,0
+9000000,8,114.875,103.5,8.25,2.7818181818181817,0,330,0
+10000000,8,153.375,150.5,9.675,3.1705426356589146,0,387,0
